@@ -29,10 +29,18 @@ def test_requested_class_must_be_allowed(cfg):
 
 
 def test_gateway_fields_are_stripped_from_forwarded_body(cfg):
-    body = _body(service_class="standard", task_type="code", session_id="s1", temperature=0)
+    body = _body(
+        service_class="standard",
+        task_type="code",
+        session_id="s1",
+        temperature=0,
+        model="evil-model",
+        priority=-100,
+        n=1,
+    )
     req = analyze(body, _tenant(cfg, "tenant-a"), cfg, approx_tokens, 0, "r")
     assert req.task_type == "code" and req.session_id == "s1"
-    assert set(req.body) == {"messages", "temperature"}
+    assert req.body == {"messages": body["messages"], "temperature": 0}
 
 
 def test_token_counts_and_output_estimate(cfg):
@@ -63,3 +71,63 @@ def test_bad_messages_rejected(cfg, body):
 def test_non_positive_max_tokens_rejected(cfg):
     with pytest.raises(BadRequest):
         analyze(_body(max_tokens=-1), _tenant(cfg, "tenant-a"), cfg, approx_tokens, 0, "r")
+
+
+@pytest.mark.parametrize("bad", ["abc", "5", 1.5, True, [], 0, -1])
+def test_bad_max_tokens_rejected(cfg, bad):
+    with pytest.raises(BadRequest, match="max_tokens"):
+        analyze(_body(max_tokens=bad), _tenant(cfg, "tenant-a"), cfg, approx_tokens, 0, "r")
+
+
+def test_max_completion_tokens_preferred_over_max_tokens(cfg):
+    req = analyze(
+        _body(max_tokens=100, max_completion_tokens=300),
+        _tenant(cfg, "tenant-a"),
+        cfg,
+        approx_tokens,
+        0,
+        "r",
+    )
+    assert req.max_tokens == 300
+
+
+def test_text_part_with_non_string_text_contributes_nothing():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": None},
+                {"type": "text", "text": 5},
+                {"type": "text", "text": "ab"},
+            ],
+        }
+    ]
+    assert prompt_text(messages) == "ab"
+
+
+@pytest.mark.parametrize("messages", [["hi"], [None], [5]])
+def test_non_dict_message_rejected(cfg, messages):
+    with pytest.raises(BadRequest):
+        analyze({"messages": messages}, _tenant(cfg, "tenant-a"), cfg, approx_tokens, 0, "r")
+
+
+@pytest.mark.parametrize("n", [2, 0, True, "1"])
+def test_n_other_than_one_rejected(cfg, n):
+    with pytest.raises(BadRequest, match="n must be 1"):
+        analyze(_body(n=n), _tenant(cfg, "tenant-a"), cfg, approx_tokens, 0, "r")
+
+
+def test_non_bool_stream_rejected(cfg):
+    with pytest.raises(BadRequest, match="stream"):
+        analyze(_body(stream="false"), _tenant(cfg, "tenant-a"), cfg, approx_tokens, 0, "r")
+
+
+def test_non_string_service_class_rejected(cfg):
+    with pytest.raises(BadRequest, match="service_class"):
+        analyze(_body(service_class=5), _tenant(cfg, "tenant-a"), cfg, approx_tokens, 0, "r")
+
+
+@pytest.mark.parametrize("body", [None, ["messages"], "messages"])
+def test_non_object_body_rejected(cfg, body):
+    with pytest.raises(BadRequest):
+        analyze(body, _tenant(cfg, "tenant-a"), cfg, approx_tokens, 0, "r")
