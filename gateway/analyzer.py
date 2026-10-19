@@ -23,6 +23,8 @@ FORWARDED_FIELDS = frozenset(
         "user",
     }
 )
+MESSAGE_FIELDS = frozenset({"role", "content"})
+MESSAGE_ROLES = frozenset({"system", "developer", "user", "assistant"})
 CHAT_TEMPLATE_TOKENS_PER_MESSAGE = 4
 
 
@@ -65,19 +67,29 @@ def qwen_token_counter(model: str = "Qwen/Qwen3-8B") -> Callable[[str], int]:
 
 
 def prompt_text(messages: list) -> str:
+    """All forwarded message text. Anything the gateway cannot count is rejected, so admission,
+    fairness and rate-limit charges cover everything sent upstream (v1 is text-only)."""
     parts: list[str] = []
     for message in messages:
-        if not isinstance(message, dict):
-            raise BadRequest("each message must be an object")
+        if not isinstance(message, dict) or set(message) - MESSAGE_FIELDS:
+            raise BadRequest("each message must be an object with only role and content")
+        if message.get("role") not in MESSAGE_ROLES:
+            raise BadRequest(f"message role must be one of {sorted(MESSAGE_ROLES)}")
         content = message.get("content")
         if isinstance(content, str):
             parts.append(content)
         elif isinstance(content, list):
             for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text = part.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
+                if (
+                    not isinstance(part, dict)
+                    or set(part) != {"type", "text"}
+                    or part["type"] != "text"
+                    or not isinstance(part["text"], str)
+                ):
+                    raise BadRequest("only text content parts are supported")
+                parts.append(part["text"])
+        else:
+            raise BadRequest("message content must be a string or a list of text parts")
     return "\n".join(parts)
 
 

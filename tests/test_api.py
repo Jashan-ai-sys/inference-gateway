@@ -91,6 +91,20 @@ async def test_bad_body_is_400(cfg):
     assert response.status_code == 400
 
 
+async def test_oversized_body_is_413(cfg):
+    big = {"messages": [{"role": "user", "content": "x" * (1024 * 1024)}]}
+    async with gateway(cfg) as (client, _):
+        response = await client.post("/v1/chat/completions", json=big, headers=AUTH_A)
+    assert response.status_code == 413
+
+
+async def test_non_text_content_is_400(cfg):
+    image = {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]}
+    async with gateway(cfg) as (client, _):
+        response = await client.post("/v1/chat/completions", json=image, headers=AUTH_A)
+    assert response.status_code == 400
+
+
 async def test_upstream_failure_maps_to_status(cfg):
     async with gateway(only_backends(cfg, "sim-strong"), chat=lambda r: httpx.Response(500)) as (
         client,

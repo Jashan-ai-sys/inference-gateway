@@ -20,6 +20,8 @@ from gateway.engine import Done, Engine, Failed, Job
 from gateway.router import NoBackend
 from gateway.scheduler import QueueFull
 
+MAX_BODY_BYTES = 1024 * 1024  # bounds memory per request; far above any benchmark prompt
+
 DISCONNECT_POLL_S = 0.5
 
 
@@ -91,8 +93,11 @@ def create_app(cfg: GatewayConfig, engine: Engine) -> FastAPI:
         tenant = _authenticate(keys, authorization)
         if tenant is None:
             return _error(401, "invalid API key")
+        raw = await http.body()
+        if len(raw) > MAX_BODY_BYTES:
+            return _error(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
         try:
-            body = await http.json()
+            body = json.loads(raw)
         except ValueError:
             return _error(400, "body must be JSON")
         if not isinstance(body, dict):

@@ -23,6 +23,17 @@ from tests.conftest import (
 USAGE = {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
 
 
+async def test_vtc_charges_reported_prompt_tokens_above_the_estimate(cfg):
+    cfg = only_backends(cfg.model_copy(update={"scheduling": "passthrough"}), "sim-strong")
+    usage = {"prompt_tokens": 300, "completion_tokens": 2, "total_tokens": 302}
+    async with httpx.AsyncClient(
+        transport=mock_transport(lambda r: sse_response(usage=usage))
+    ) as c:
+        engine = Engine(cfg, c)
+        await drain(engine.submit(make_request(cfg, prompt=100, now=engine.clock())))
+    assert engine.vtc.counter("tenant-a") == 300 + 2 * 2  # estimate 100, upstream reported 300
+
+
 async def test_passthrough_streams_and_accounts(cfg):
     cfg = only_backends(cfg.model_copy(update={"scheduling": "passthrough"}), "sim-strong")
     log = io.StringIO()

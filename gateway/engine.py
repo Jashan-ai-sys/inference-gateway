@@ -303,6 +303,9 @@ class Engine:
         job.finished = True
         job.out.put_nowait(Done(result))
         try:
+            if result.prompt_tokens is not None and result.prompt_tokens > req.prompt_tokens:
+                # The local estimate was low: charge the tenant the upstream-reported remainder.
+                self.vtc.charge_prompt(req.tenant, result.prompt_tokens - req.prompt_tokens)
             if result.first_token_at is not None:
                 # The router adds the prefill term itself, so the base-TTFT EWMA keeps the rest.
                 backend = self.backends[req.backend]

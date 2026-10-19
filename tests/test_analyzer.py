@@ -60,11 +60,28 @@ def test_max_tokens_defaults_to_class_p90(cfg):
     assert req.max_tokens == 800
 
 
-def test_list_content_parts_are_counted():
+def test_list_text_parts_are_counted():
     messages = [
-        {"role": "user", "content": [{"type": "text", "text": "ab"}, {"type": "image_url"}]}
+        {"role": "user", "content": [{"type": "text", "text": "ab"}, {"type": "text", "text": "c"}]}
     ]
-    assert prompt_text(messages) == "ab"
+    assert prompt_text(messages) == "ab\nc"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]},
+        {"role": "user", "content": [{"type": "text", "text": "ab", "extra": "x" * 10000}]},
+        {"role": "user", "content": "hi", "name": "x" * 10000},
+        {"role": "tool", "content": "hi"},
+        {"role": "user", "content": {"text": "hi"}},
+        {"role": "user"},
+    ],
+)
+def test_uncountable_message_content_is_rejected(message):
+    # Everything forwarded upstream must be counted, or admission and fairness can be bypassed.
+    with pytest.raises(BadRequest):
+        prompt_text([message])
 
 
 @pytest.mark.parametrize("body", [{}, {"messages": []}, {"messages": "hi"}])
@@ -96,18 +113,10 @@ def test_max_completion_tokens_preferred_over_max_tokens(cfg):
     assert req.max_tokens == 300
 
 
-def test_text_part_with_non_string_text_contributes_nothing():
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": None},
-                {"type": "text", "text": 5},
-                {"type": "text", "text": "ab"},
-            ],
-        }
-    ]
-    assert prompt_text(messages) == "ab"
+@pytest.mark.parametrize("text", [None, 5])
+def test_text_part_with_non_string_text_is_rejected(text):
+    with pytest.raises(BadRequest):
+        prompt_text([{"role": "user", "content": [{"type": "text", "text": text}]}])
 
 
 @pytest.mark.parametrize("messages", [["hi"], [None], [5]])
