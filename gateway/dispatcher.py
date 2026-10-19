@@ -40,6 +40,10 @@ class StreamResult:
     finish_reason: str | None
 
 
+def _choices(chunk: dict) -> list[dict]:
+    return [c for c in chunk.get("choices") or [] if isinstance(c, dict)]
+
+
 def build_body(req: Request, backend: BackendConfig) -> dict:
     body = {**req.body, **backend.extra_body}
     body.pop("max_completion_tokens", None)
@@ -58,11 +62,21 @@ def build_body(req: Request, backend: BackendConfig) -> dict:
 def count_chunk_tokens(chunk: dict) -> int:
     """vLLM and most providers stream about one token per content delta; usage corrects it."""
     count = 0
-    for choice in chunk.get("choices") or []:
-        delta = choice.get("delta") or {}
-        if delta.get("content") or delta.get("reasoning_content"):
+    for choice in _choices(chunk):
+        delta = choice.get("delta")
+        if isinstance(delta, dict) and (delta.get("content") or delta.get("reasoning_content")):
             count += 1
     return count
+
+
+def _parse_chunk(data: str) -> dict:
+    try:
+        chunk = json.loads(data)
+    except ValueError as exc:
+        raise UpstreamError(None, "malformed stream chunk") from exc
+    if not isinstance(chunk, dict):
+        raise UpstreamError(None, "malformed stream chunk")
+    return chunk
 
 
 def _retry_after(response: httpx.Response) -> float | None:
@@ -97,20 +111,22 @@ async def stream_chat(
                 data = line[len("data:") :].strip()
                 if data == "[DONE]":
                     break
-                chunk = json.loads(data)
+                chunk = _parse_chunk(data)
                 if "error" in chunk:
                     raise UpstreamError(None, json.dumps(chunk["error"])[:500])
-                if chunk.get("usage"):
+                if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
                     usage = chunk["usage"]
                 n = count_chunk_tokens(chunk)
                 if n and first_token_at is None:
                     first_token_at = clock()
                 counted += n
-                for choice in chunk.get("choices") or []:
+                for choice in _choices(chunk):
                     finish = choice.get("finish_reason") or finish
                 await on_chunk(chunk)
-    except httpx.TransportError as exc:
+    except (httpx.RequestError, httpx.StreamError) as exc:
         raise UpstreamError(None, f"{type(exc).__name__}: {exc}") from exc
-    output_tokens = usage.get("completion_tokens", counted) if usage else counted
-    prompt_tokens = usage.get("prompt_tokens") if usage else None
+    reported_output = usage.get("completion_tokens") if usage else None
+    reported_prompt = usage.get("prompt_tokens") if usage else None
+    output_tokens = reported_output if type(reported_output) is int else counted
+    prompt_tokens = reported_prompt if type(reported_prompt) is int else None
     return StreamResult(output_tokens, prompt_tokens, first_token_at, clock(), finish)

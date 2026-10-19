@@ -112,3 +112,45 @@ async def test_cancelling_closes_the_upstream_stream(cfg):
         with pytest.raises(asyncio.CancelledError):
             await task
     assert stream.closed
+
+
+def _raw(body: bytes) -> httpx.Response:
+    return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"data: not-json\n\n", b"data: [1,2]\n\n", b"data: null\n\n", b'data: {"choices": [\n\n'],
+)
+async def test_malformed_stream_chunk_is_upstream_error(cfg, body):
+    transport = httpx.MockTransport(lambda r: _raw(body))
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(UpstreamError):
+            await stream_chat(client, cfg.backend_by_name("sim-strong"), {}, _noop, FakeClock())
+
+
+async def test_in_stream_error_chunk_is_upstream_error(cfg):
+    transport = httpx.MockTransport(lambda r: _raw(b'data: {"error": {"message": "boom"}}\n\n'))
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(UpstreamError) as err:
+            await stream_chat(client, cfg.backend_by_name("sim-strong"), {}, _noop, FakeClock())
+    assert "boom" in str(err.value)
+
+
+@pytest.mark.parametrize("usage", [{"completion_tokens": None}, "junk"])
+async def test_unusable_usage_falls_back_to_counted_tokens(cfg, usage):
+    transport = httpx.MockTransport(lambda r: sse_response(("a", "b"), usage=usage))
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await stream_chat(
+            client, cfg.backend_by_name("sim-strong"), {}, _noop, FakeClock()
+        )
+    assert result.output_tokens == 2 and result.prompt_tokens is None
+
+
+async def test_httpx_request_errors_are_upstream_errors(cfg):
+    def broken(request):
+        raise httpx.DecodingError("bad encoding")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(broken)) as client:
+        with pytest.raises(UpstreamError):
+            await stream_chat(client, cfg.backend_by_name("sim-strong"), {}, _noop, FakeClock())
