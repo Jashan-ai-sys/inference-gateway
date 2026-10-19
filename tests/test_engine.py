@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import time
 
 import httpx
 import pytest
@@ -35,7 +36,9 @@ async def test_passthrough_streams_and_accounts(cfg):
     assert engine.vtc.counter("tenant-a") == 100 + 2 * 2
     assert engine.sessions.get("tenant-a", "s1").tokens == 12
     assert engine.jobs == {}
-    assert json.loads(log.getvalue())["backend"] == "sim-strong"
+    entry = json.loads(log.getvalue())
+    assert entry["backend"] == "sim-strong"
+    assert abs(entry["wall"] - time.time()) < 60
     sample = engine.metrics.registry.get_sample_value(
         "gateway_requests_total", {"cls": "standard", "backend": "sim-strong", "outcome": "ok"}
     )

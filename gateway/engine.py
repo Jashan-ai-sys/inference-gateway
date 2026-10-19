@@ -346,6 +346,7 @@ class Engine:
             return
         entry = {
             "t": self.clock(),
+            "wall": time.time(),  # joins with load-generator timestamps; "t" is the engine clock
             "request": req.id,
             "tenant": req.tenant,
             "class": req.cls.name,
