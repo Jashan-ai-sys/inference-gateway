@@ -262,3 +262,24 @@ async def test_queue_full_is_logged_with_error(cfg):
         engine.submit(make_request(cfg, now=engine.clock()))
     entries = [json.loads(line) for line in log.getvalue().splitlines()]
     assert len(entries) == 1 and entries[0]["error"] == "queue_full"
+
+
+async def test_slow_long_prompt_does_not_lock_out_interactive_requests(cfg):
+    """A 1.2 s engine TTFT on a 4000-token prompt is mostly prefill (1 s at 4000 tok/s); only the
+    residual may enter the base-TTFT EWMA, or every later interactive request misses its 1 s
+    target on prediction alone."""
+    cfg = only_backends(cfg, "sim-strong")
+    clock = FakeClock()
+
+    def handler(request):
+        clock.advance(1.2)
+        return sse_response(usage=USAGE)
+
+    async with httpx.AsyncClient(transport=mock_transport(handler)) as c:
+        engine = Engine(cfg, c, clock=clock)
+        await engine.start()
+        await drain(engine.submit(make_request(cfg, prompt=4000, now=clock())))
+        short = engine.submit(make_request(cfg, cls="interactive", prompt=20, now=clock()))
+        await engine.stop()
+    assert engine.health["sim-strong"].base_ttft() == pytest.approx(0.2)
+    assert short.req.backend == "sim-strong"

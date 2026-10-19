@@ -78,7 +78,8 @@ class BackendHealth:
         self.stats = EngineStats()
 
     def base_ttft(self) -> float:
-        """Dispatch-to-first-token, measured; the config prior until the first success."""
+        """Dispatch-to-first-token minus estimated prefill, measured; the config prior until the
+        first success."""
         return self.ttft.value if self.ttft.value is not None else self.backend.base_ttft_s
 
     def error_rate(self) -> float:

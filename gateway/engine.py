@@ -24,7 +24,7 @@ from gateway.dispatcher import (
     stream_chat,
 )
 from gateway.metrics import GatewayMetrics
-from gateway.router import Decision, NoBackend, route
+from gateway.router import Decision, NoBackend, route, uncached_tokens
 from gateway.scheduler import BackendScheduler, QueueFull
 from gateway.sessions import SessionStore
 from gateway.telemetry import BackendHealth, poll_once
@@ -285,7 +285,13 @@ class Engine:
         job.out.put_nowait(Done(result))
         try:
             if result.first_token_at is not None:
-                self.health[req.backend].record_success(result.first_token_at - req.dispatched_at)
+                # The router adds the prefill term itself, so the base-TTFT EWMA keeps the rest.
+                backend = self.backends[req.backend]
+                uncached = uncached_tokens(req, req.backend, self.sessions)
+                engine_ttft = result.first_token_at - req.dispatched_at
+                self.health[req.backend].record_success(
+                    max(0.0, engine_ttft - uncached / backend.prefill_tokens_per_s)
+                )
             if req.session_id:
                 prompt_tokens = result.prompt_tokens or req.prompt_tokens
                 self.sessions.update(

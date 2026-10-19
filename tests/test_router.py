@@ -137,3 +137,11 @@ def test_request_too_large_for_hosted_tpm_is_permanent(cfg, monkeypatch):
         decide(cfg, make_request(cfg, cls="background", prompt=9000, max_tokens=50))
     assert err.value.status == 400
     assert err.value.rejected["groq-gpt-oss-20b"] == "rate_limit_size"
+
+
+def test_passthrough_does_not_shed_on_predicted_deadline(cfg):
+    cfg = only_backends(cfg.model_copy(update={"scheduling": "passthrough"}), "sim-strong")
+    cfg = with_backend(cfg, "sim-strong", base_ttft_s=100.0)
+    decision = decide(cfg, make_request(cfg, cls="interactive"))
+    assert decision.backend == "sim-strong"
+    assert decision.candidates[0].predicted_ttft > 100.0

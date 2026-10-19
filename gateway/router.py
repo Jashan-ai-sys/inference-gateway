@@ -113,7 +113,8 @@ def route(
             + uncached / backend.prefill_tokens_per_s
             + health[name].base_ttft()
         )
-        if now + ttft > req.deadline:
+        # Passthrough arms leave scheduling to the engine (FIFO or vLLM priority): no shedding here.
+        if cfg.scheduling != "passthrough" and now + ttft > req.deadline:
             rejected[name] = "deadline"
             continue
         candidates.append(
