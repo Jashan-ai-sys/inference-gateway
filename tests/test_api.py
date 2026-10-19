@@ -98,6 +98,16 @@ async def test_oversized_body_is_413(cfg):
     assert response.status_code == 413
 
 
+async def test_oversized_chunked_body_without_length_is_413(cfg):
+    async def chunks():
+        for _ in range(3):
+            yield b"x" * (600 * 1024)
+
+    async with gateway(cfg) as (client, _):
+        response = await client.post("/v1/chat/completions", content=chunks(), headers=AUTH_A)
+    assert response.status_code == 413
+
+
 async def test_non_text_content_is_400(cfg):
     image = {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]}
     async with gateway(cfg) as (client, _):

@@ -22,6 +22,22 @@ from gateway.scheduler import QueueFull
 
 MAX_BODY_BYTES = 1024 * 1024  # bounds memory per request; far above any benchmark prompt
 
+
+async def _read_capped(http: HttpRequest) -> bytes | None:
+    """The request body, or None once it exceeds MAX_BODY_BYTES (never buffered beyond that)."""
+    declared = http.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in http.stream():
+        size += len(chunk)
+        if size > MAX_BODY_BYTES:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 DISCONNECT_POLL_S = 0.5
 
 
@@ -93,8 +109,8 @@ def create_app(cfg: GatewayConfig, engine: Engine) -> FastAPI:
         tenant = _authenticate(keys, authorization)
         if tenant is None:
             return _error(401, "invalid API key")
-        raw = await http.body()
-        if len(raw) > MAX_BODY_BYTES:
+        raw = await _read_capped(http)
+        if raw is None:
             return _error(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
         try:
             body = json.loads(raw)
