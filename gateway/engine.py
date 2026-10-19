@@ -53,6 +53,7 @@ class Job:
     out: asyncio.Queue = field(default_factory=asyncio.Queue)
     task: asyncio.Task | None = None
     finished: bool = False
+    prompt_charged: bool = False
 
 
 class Engine:
@@ -92,13 +93,14 @@ class Engine:
 
     async def stop(self) -> None:
         for job in list(self.jobs.values()):
+            if not job.finished:
+                job.out.put_nowait(Failed(503, "gateway shutting down"))
             self.cancel(job)
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        await self.client.aclose()
 
     def submit(self, req: Request) -> Job:
         decision = self._route(req)
@@ -107,14 +109,17 @@ class Engine:
         if self.cfg.scheduling == "passthrough":
             self.jobs[req.id] = job
             scheduler.admit(req, self.clock())
+            self._log_decision(req, decision, None)
             self._launch(job)
             return job
         try:
             scheduler.enqueue(req)
         except QueueFull:
             self.metrics.rejections.labels(req.cls.name, "queue_full").inc()
+            self._log_decision(req, None, "queue_full", {})
             raise
         self.jobs[req.id] = job
+        self._log_decision(req, decision, None)
         self._wake.set()
         return job
 
@@ -124,7 +129,7 @@ class Engine:
         job.finished = True
         self.metrics.requests.labels(job.req.cls.name, job.req.backend, "cancelled").inc()
         if job.task is not None:
-            job.task.cancel()  # _run's finally releases the reservation
+            job.task.cancel()  # the done-callback from _launch releases the reservation
             return
         scheduler = self.schedulers.get(job.req.backend)
         if scheduler is not None:
@@ -144,16 +149,18 @@ class Engine:
             )
         except NoBackend as exc:
             self.metrics.rejections.labels(req.cls.name, "no_backend").inc()
-            self._log_decision(req, None, exc)
+            self._log_decision(req, None, str(exc), exc.rejected)
             raise
         req.backend = decision.backend
-        self._log_decision(req, decision, None)
         return decision
 
     async def _dispatch_loop(self) -> None:
         while True:
             self._wake.clear()
-            self._tick()
+            try:
+                self._tick()
+            except Exception:
+                log.exception("dispatch tick failed")
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), LOOP_TICK_S)
 
@@ -195,6 +202,7 @@ class Engine:
             self.schedulers[decision.backend].requeue_front(req)
             self.metrics.reroutes.labels(req.cls.name).inc()
             self._log_decision(req, decision, None)
+            self._wake.set()
 
     def _expire(self, req: Request) -> None:
         job = self.jobs.pop(req.id, None)
@@ -205,16 +213,27 @@ class Engine:
         job.out.put_nowait(Failed(503, "deadline exceeded while queued"))
 
     def _launch(self, job: Job) -> None:
-        job.task = asyncio.create_task(self._run(job))
+        task = asyncio.create_task(self._run(job))
+        job.task = task
+        task.add_done_callback(lambda _: self._cleanup(job, task))
+
+    def _cleanup(self, job: Job, task: asyncio.Task) -> None:
+        """Idempotent; also the done-callback, so it runs for a never-started cancelled task."""
+        if job.task is not task:
+            return
+        self.schedulers[job.req.backend].release(job.req)
+        self.jobs.pop(job.req.id, None)
+        self._wake.set()
 
     async def _run(self, job: Job) -> None:
         req = job.req
         backend = self.backends[req.backend]
         scheduler = self.schedulers[req.backend]
         health = self.health[req.backend]
-        requeued = False
         streamed = 0
-        self.vtc.charge_prompt(req.tenant, req.prompt_tokens)
+        if not job.prompt_charged:
+            job.prompt_charged = True
+            self.vtc.charge_prompt(req.tenant, req.prompt_tokens)
 
         async def on_chunk(chunk: dict) -> None:
             nonlocal streamed
@@ -235,7 +254,6 @@ class Engine:
                 scheduler.release(req)
                 scheduler.requeue_front(req)
                 job.task = None
-                requeued = True
                 self._wake.set()
                 return
             self._fail(job, 503, "backend busy")
@@ -244,7 +262,10 @@ class Engine:
             self._fail(job, 504, "upstream timeout")
         except UpstreamError as exc:
             health.record_failure(self.clock())
-            self._fail(job, 502, f"upstream error: {exc}")
+            log.warning("upstream error from %s: %s", req.backend, exc)
+            self._fail(
+                job, 502, f"upstream error ({exc.status})" if exc.status else "upstream error"
+            )
         except Exception:
             health.record_failure(self.clock())
             log.exception("unexpected error from %s", req.backend)
@@ -254,23 +275,25 @@ class Engine:
                 self.vtc.charge_output(req.tenant, result.output_tokens - streamed)
             self._finish(job, result)
         finally:
-            if not requeued:
-                scheduler.release(req)
-                self.jobs.pop(req.id, None)
-                self._wake.set()
+            self._cleanup(
+                job, asyncio.current_task()
+            )  # idempotent; the callback covers early cancel
 
     def _finish(self, job: Job, result: StreamResult) -> None:
         req = job.req
         job.finished = True
-        if result.first_token_at is not None:
-            self.health[req.backend].record_success(result.first_token_at - req.dispatched_at)
-        if req.session_id:
-            prompt_tokens = result.prompt_tokens or req.prompt_tokens
-            self.sessions.update(
-                req.tenant, req.session_id, req.backend, prompt_tokens + result.output_tokens
-            )
-        self.metrics.record_finished(req, result, self.backends[req.backend])
         job.out.put_nowait(Done(result))
+        try:
+            if result.first_token_at is not None:
+                self.health[req.backend].record_success(result.first_token_at - req.dispatched_at)
+            if req.session_id:
+                prompt_tokens = result.prompt_tokens or req.prompt_tokens
+                self.sessions.update(
+                    req.tenant, req.session_id, req.backend, prompt_tokens + result.output_tokens
+                )
+            self.metrics.record_finished(req, result, self.backends[req.backend])
+        except Exception:
+            log.exception("bookkeeping failed for %s", req.id)
 
     def _fail(self, job: Job, status: int, message: str) -> None:
         job.finished = True
@@ -280,12 +303,19 @@ class Engine:
     async def _telemetry_loop(self) -> None:
         while True:
             for name, backend in self.backends.items():
-                await poll_once(self.client, backend, self.health[name])
-                self.schedulers[name].engine_kv_usage = self.health[name].stats.kv_usage
+                try:
+                    await poll_once(self.client, backend, self.health[name])
+                    self.schedulers[name].engine_kv_usage = self.health[name].stats.kv_usage
+                except Exception:
+                    log.exception("telemetry poll failed for %s", name)
             await asyncio.sleep(self.cfg.telemetry_interval_s)
 
     def _log_decision(
-        self, req: Request, decision: Decision | None, error: NoBackend | None
+        self,
+        req: Request,
+        decision: Decision | None,
+        error: str | None,
+        rejected: dict[str, str] | None = None,
     ) -> None:
         if self.decision_log is None:
             return
@@ -307,6 +337,6 @@ class Engine:
                 rejected=decision.rejected,
             )
         else:
-            entry.update(backend=None, error=str(error), rejected=error.rejected)
+            entry.update(backend=None, error=error, rejected=rejected)
         self.decision_log.write(json.dumps(entry) + "\n")
         self.decision_log.flush()

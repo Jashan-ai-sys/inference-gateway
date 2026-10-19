@@ -176,3 +176,89 @@ async def test_unexpected_upstream_exception_still_fails_the_job(cfg, monkeypatc
     assert isinstance(items[-1], Failed) and items[-1].status == 502
     assert engine.health["sim-strong"].consecutive_failures == 1
     assert engine.jobs == {}
+
+
+async def test_cancel_before_task_starts_releases_passthrough_reservation(cfg):
+    cfg = only_backends(cfg.model_copy(update={"scheduling": "passthrough"}), "sim-strong")
+    async with httpx.AsyncClient(transport=mock_transport(lambda r: sse_response())) as c:
+        engine = Engine(cfg, c)
+        engine.cancel(engine.submit(make_request(cfg, now=engine.clock())))
+        await asyncio.sleep(0.01)
+    assert engine.jobs == {} and engine.schedulers["sim-strong"].in_flight == {}
+
+
+async def test_cancel_before_task_starts_releases_gateway_reservation(cfg):
+    cfg = only_backends(cfg, "sim-strong")
+    async with httpx.AsyncClient(transport=mock_transport(lambda r: sse_response())) as c:
+        engine = Engine(cfg, c)
+        job = engine.submit(make_request(cfg, now=engine.clock()))
+        engine._tick()
+        engine.cancel(job)
+        await asyncio.sleep(0.01)
+    assert engine.jobs == {} and engine.schedulers["sim-strong"].in_flight == {}
+
+
+async def test_dispatch_loop_survives_a_failing_tick(cfg, monkeypatch):
+    cfg = only_backends(cfg, "sim-strong")
+    async with httpx.AsyncClient(transport=mock_transport(lambda r: sse_response())) as c:
+        engine = Engine(cfg, c)
+        original, calls = engine._tick, []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("disk full")
+            original()
+
+        monkeypatch.setattr(engine, "_tick", flaky)
+        await engine.start()
+        items = await drain(engine.submit(make_request(cfg, now=engine.clock())))
+        await engine.stop()
+    assert isinstance(items[-1], Done)
+
+
+async def test_upstream_error_message_does_not_leak_internal_detail(cfg):
+    cfg = only_backends(cfg.model_copy(update={"scheduling": "passthrough"}), "sim-strong")
+    transport = mock_transport(lambda r: httpx.Response(500, text="failed http://10.0.0.5/x"))
+    async with httpx.AsyncClient(transport=transport) as c:
+        engine = Engine(cfg, c)
+        items = await drain(engine.submit(make_request(cfg, now=engine.clock())))
+    assert isinstance(items[-1], Failed) and "10.0.0.5" not in items[-1].message
+
+
+async def test_stop_fails_unfinished_jobs_and_leaves_client_open(cfg):
+    cfg = only_backends(with_backend(cfg, "sim-strong", max_in_flight=0), "sim-strong")
+    async with httpx.AsyncClient(transport=mock_transport(lambda r: sse_response())) as c:
+        engine = Engine(cfg, c)
+        job = engine.submit(make_request(cfg, now=engine.clock()))
+        await engine.stop()
+        assert not c.is_closed
+    assert job.out.get_nowait() == Failed(503, "gateway shutting down")
+
+
+async def test_prompt_is_charged_once_across_backpressure_retries(cfg):
+    cfg = only_backends(cfg, "sim-strong")
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) < 3:
+            return httpx.Response(503, headers={"Retry-After": "0.02"})
+        return sse_response(usage=USAGE)
+
+    async with httpx.AsyncClient(transport=mock_transport(handler)) as c:
+        engine = Engine(cfg, c)
+        await engine.start()
+        await drain(engine.submit(make_request(cfg, prompt=100, now=engine.clock())))
+        await engine.stop()
+    assert engine.vtc.counter("tenant-a") == 100 + 2 * 2
+
+
+async def test_queue_full_is_logged_with_error(cfg):
+    cfg = only_backends(with_class(cfg, "standard", queue_limit=0), "sim-strong")
+    log = io.StringIO()
+    engine = Engine(cfg, httpx.AsyncClient(), decision_log=log)
+    with pytest.raises(QueueFull):
+        engine.submit(make_request(cfg, now=engine.clock()))
+    entries = [json.loads(line) for line in log.getvalue().splitlines()]
+    assert len(entries) == 1 and entries[0]["error"] == "queue_full"

@@ -77,11 +77,11 @@ class GatewayMetrics:
         ttft = result.first_token_at - req.arrival
         self.ttft.labels(cls, name).observe(ttft)
         self.engine_ttft.labels(cls, name).observe(result.first_token_at - req.dispatched_at)
-        tpot = 0.0
+        met = ttft <= req.cls.ttft_target_s
         if result.output_tokens > 1:
             tpot = (result.finished_at - result.first_token_at) / (result.output_tokens - 1)
-        self.tpot.labels(cls, name).observe(tpot)
-        met = ttft <= req.cls.ttft_target_s and tpot <= req.cls.tpot_target_s
+            self.tpot.labels(cls, name).observe(tpot)
+            met = met and tpot <= req.cls.tpot_target_s
         if met:
             self.goodput.labels(cls, name).inc()
         return met
