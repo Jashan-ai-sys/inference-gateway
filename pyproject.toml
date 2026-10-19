@@ -1,0 +1,39 @@
+[project]
+name = "inference-gateway"
+version = "0.1.0"
+description = "Model router + workload scheduler in front of vLLM and hosted LLM APIs"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "httpx>=0.27",
+  "pydantic>=2.8",
+  "pyyaml>=6",
+  "prometheus-client>=0.20",
+  "tokenizers>=0.20",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gateway"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["integration: needs the llm-d-inference-sim containers (make sim-up)"]
+addopts = "-m 'not integration'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

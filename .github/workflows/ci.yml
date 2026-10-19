@@ -1,0 +1,30 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - run: uv sync
+      - run: docker compose -f docker-compose.sim.yml up -d
+      - name: Wait for simulators
+        run: |
+          for i in $(seq 60); do
+            curl -sf localhost:8001/metrics >/dev/null && curl -sf localhost:8002/metrics >/dev/null && exit 0
+            sleep 1
+          done
+          exit 1
+      - run: uv run pytest -m integration
