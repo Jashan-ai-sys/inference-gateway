@@ -1,0 +1,328 @@
+{
+ "techniques": [
+  {
+   "name": "Static batching vs continuous / in-flight batching",
+   "category": "Scheduling & batching",
+   "one_line": "Static batching pads a fixed batch and waits for its longest sequence to finish. Continuous (in-flight) batching lets requests join and leave the running batch at every step.",
+   "bottleneck_addressed": "Scheduling: idle GPU slots and head-of-line blocking. It also raises decode batch size, which spreads weight reads in memory-bandwidth-bound decode across more tokens.",
+   "tradeoff": "Throughput goes up a lot, but each request's latency varies with its batch-mates, and the scheduler needs paged KV to avoid fragmentation.",
+   "vllm_support": "Always on in vLLM v0.32.0 (V1 engine); static batching is not offered. Batch size is capped by --max-num-seqs (concurrent sequences) and --max-num-batched-tokens (token budget per step). There is also --max-num-scheduled-tokens.",
+   "key_source": "Yu et al., 'Orca: A Distributed Serving System for Transformer-Based Generative Models', OSDI 2022; https://docs.vllm.ai/en/latest/configuration/optimization.html"
+  },
+  {
+   "name": "Iteration-level scheduling (and async scheduling)",
+   "category": "Scheduling & batching",
+   "one_line": "The scheduler decides again every forward step which tokens of which requests run, instead of once per request. Async scheduling plans step N+1 while step N runs on the GPU.",
+   "bottleneck_addressed": "Scheduling and CPU overhead: GPU bubbles between steps, which matter most for small, fast decode steps.",
+   "tradeoff": "Much better utilisation, but scheduling is more complex. Async scheduling overlaps work, so some features (e.g. certain structured-output or spec-decode paths) need special handling.",
+   "vllm_support": "The V1 scheduler is iteration-level with a unified token budget, so prefill and decode tokens share one step. --async-scheduling / --no-async-scheduling (default None = auto-enabled where supported). --stream-interval N (default 1) batches output streaming. --scheduler-cls plugs in a custom scheduler.",
+   "key_source": "Orca (OSDI 2022); vLLM V1 guide https://docs.vllm.ai/en/latest/usage/v1_guide.html"
+  },
+  {
+   "name": "Chunked prefill",
+   "category": "Scheduling & batching",
+   "one_line": "Long prompts are split into chunks and co-scheduled with ongoing decodes under a per-step token budget, so one big prefill cannot stall every decode.",
+   "bottleneck_addressed": "Mixes compute-bound prefill with memory-bound decode in one step, raising utilisation. It also bounds decode inter-token latency (ITL/TPOT).",
+   "tradeoff": "Small chunks give better ITL but slower TTFT and lower prefill efficiency; large chunks the reverse. Tune with --max-num-batched-tokens.",
+   "vllm_support": "On by default: --enable-chunked-prefill / --disable-chunked-prefill (default True). Budget: --max-num-batched-tokens. Fairness: --long-prefill-token-threshold (default 0 = off) plus long_prefill_token_threshold_adaptive. --disable-chunked-mm-input stops multimodal items from being split. --prefill-schedule-interval sets prefill cadence.",
+   "key_source": "Agrawal et al., 'SARATHI' (arXiv 2308.16369) / 'Sarathi-Serve', OSDI 2024; https://docs.vllm.ai/en/latest/configuration/optimization.html#chunked-prefill"
+  },
+  {
+   "name": "Preemption: recompute vs swap",
+   "category": "Scheduling & batching",
+   "one_line": "When KV blocks run out, running requests are evicted. They are either recomputed from their tokens later, or their KV is swapped to CPU and back.",
+   "bottleneck_addressed": "Memory capacity (KV cache overflow under load).",
+   "tradeoff": "Recompute wastes prefill FLOPs but has no PCIe traffic; swap saves compute but costs host bandwidth and is complex. Frequent preemption hurts end-to-end latency either way.",
+   "vllm_support": "The V1 engine uses RECOMPUTE only; swap mode and --swap-space are gone from v0.32.0 arg_utils. Mitigations: raise --gpu-memory-utilization (default 0.92) or --kv-cache-memory-bytes, lower --max-num-seqs / --max-num-batched-tokens, add TP/PP, or use KV offload. --watermark (default 0.0) reserves KV headroom at admission. Monitor vllm:num_preemptions.",
+   "key_source": "Kwon et al., PagedAttention, SOSP 2023 (\u00a74.5); https://docs.vllm.ai/en/latest/configuration/optimization.html#preemption"
+  },
+  {
+   "name": "Priority scheduling",
+   "category": "Scheduling & batching",
+   "one_line": "Requests are ordered by a client-supplied priority (lower value runs first; ties go to arrival time) instead of FCFS, and low-priority running requests can be preempted.",
+   "bottleneck_addressed": "Scheduling: SLO and tenant differentiation under contention.",
+   "tradeoff": "Low-priority requests can starve, and preemption causes recompute churn. Callers must set priorities sensibly.",
+   "vllm_support": "--scheduling-policy {fcfs,priority} (default fcfs). Per-request 'priority' field in the OpenAI-compatible API / SamplingParams path. Admission limits: --max-num-queued-reqs / --max-num-queued-tokens (scheduler config).",
+   "key_source": "vLLM SchedulerConfig.policy (vllm/config/scheduler.py, v0.32.0); https://docs.vllm.ai/en/latest/configuration/engine_args.html"
+  },
+  {
+   "name": "PagedAttention",
+   "category": "Memory & KV cache",
+   "one_line": "KV cache is stored in fixed-size blocks mapped through per-request block tables, like OS virtual memory. This removes contiguous pre-allocation and fragmentation.",
+   "bottleneck_addressed": "Memory capacity: near-zero KV waste allows much larger batches, which in turn helps bandwidth-bound decode.",
+   "tradeoff": "Attention kernels must handle the indirection. Block size trades internal fragmentation against kernel efficiency and prefix-hash granularity.",
+   "vllm_support": "Core and always on. --block-size (default chosen per backend/platform). Memory budget: --gpu-memory-utilization (default 0.92) or --kv-cache-memory-bytes (overrides it). The KV blocks themselves are not offloaded by --cpu-offload-gb, which offloads weights.",
+   "key_source": "Kwon et al., 'Efficient Memory Management for LLM Serving with PagedAttention', SOSP 2023 (arXiv 2309.06180)"
+  },
+  {
+   "name": "Automatic prefix caching (APC)",
+   "category": "Memory & KV cache",
+   "one_line": "Full KV blocks are hashed by their token prefix (plus LoRA, multimodal and salt) and reused across requests that share the prefix, so the shared prefill is skipped.",
+   "bottleneck_addressed": "Compute-bound prefill: lower TTFT and higher throughput for shared system prompts, multi-turn chat, RAG and agents.",
+   "tradeoff": "Cached blocks compete with live requests (LRU eviction). Hashing has a small CPU cost. Only block-aligned prefixes hit, and cross-tenant cache timing side channels mean a per-tenant cache_salt may be needed.",
+   "vllm_support": "On by default in V1: --enable-prefix-caching / --disable-prefix-caching (default True). --prefix-caching-hash-algo {sha256,sha256_cbor,xxhash,xxhash_cbor} (default sha256). --prefix-cache-retention-interval, --prefix-match-unit. Metrics: vllm:prefix_cache_queries / vllm:prefix_cache_hits.",
+   "key_source": "https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html; design doc https://docs.vllm.ai/en/latest/design/prefix_caching.html"
+  },
+  {
+   "name": "RadixAttention",
+   "category": "Memory & KV cache",
+   "one_line": "SGLang keeps KV for all past requests in a radix tree over token sequences, giving token-granular automatic prefix reuse with LRU eviction and cache-aware scheduling.",
+   "bottleneck_addressed": "Compute-bound prefill, through maximum prefix reuse.",
+   "tradeoff": "The tree has to be maintained. Scheduling for cache hits can hurt fairness.",
+   "vllm_support": "Not in vLLM. vLLM's equivalent is block-hash-based APC (above): a hash chain per block rather than a radix tree, so hits are block-granular (--block-size / --prefix-match-unit).",
+   "key_source": "Zheng et al., 'SGLang: Efficient Execution of Structured Language Model Programs', NeurIPS 2024 (arXiv 2312.07104)"
+  },
+  {
+   "name": "KV-cache quantisation",
+   "category": "Memory & KV cache",
+   "one_line": "K/V are stored in FP8, or 4-bit or other low-bit formats, instead of BF16, which halves or quarters KV bytes per token.",
+   "bottleneck_addressed": "Memory capacity (more concurrent tokens) and memory bandwidth in long-context decode (fewer KV bytes read per step).",
+   "tradeoff": "Some accuracy loss, worse at 4-bit and on sensitive layers such as sliding-window ones. Calibrated scales are needed for the best quality, and support varies by attention backend.",
+   "vllm_support": "--kv-cache-dtype (default auto). v0.32.0 accepts: fp8, fp8_e4m3, fp8_e5m2, fp8_inc, fp8_ds_mla, nvfp4_ds_mla, nvfp4, nvfp4_4over6, int8_per_token_head, int4_per_token_head, fp8_per_token_head, turboquant_k8v4 / turboquant_4bit_nc / turboquant_k3v4_nc / turboquant_3bit_nc, ultraquant_4bit. --kv-cache-dtype-skip-layers (e.g. sliding_window, or layer indices). Calibrated q/k/v scales come via llm-compressor checkpoints; with FA3 + FP8 KV, attention itself runs in FP8.",
+   "key_source": "https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache.html; Hooper et al., 'KVQuant' (arXiv 2401.18079)"
+  },
+  {
+   "name": "KV cache offload / tiering (native CPU offload, LMCache)",
+   "category": "Memory & KV cache",
+   "one_line": "Evicted or finished KV blocks are moved to CPU DRAM, local disk or remote stores and reloaded on prefix hits, so the cache outgrows HBM and can be shared across instances.",
+   "bottleneck_addressed": "Memory capacity, plus prefill compute saved on cache hits (multi-turn, RAG, long docs).",
+   "tradeoff": "Load time over PCIe or network can exceed recompute time for short prefixes. Host memory and ops complexity add cost. Cross-node sharing needs a store such as LMCache, Mooncake or 3FS.",
+   "vllm_support": "Simple path: --kv-offloading-size <GiB> plus --kv-offloading-backend {native,lmcache} (default native; nothing happens unless the size is set). Full control: --kv-transfer-config '{\"kv_connector\":\"OffloadingConnector\"|\"LMCacheConnectorV1\"|\"LMCacheMPConnector\"|\"SimpleCPUOffloadConnector\"|\"FlexKVConnectorV1\"|\"MooncakeStoreConnector\"|\"HF3FSKVConnector\",\"kv_role\":\"kv_both\",...}'; chain several with MultiConnector. Do not confuse with --cpu-offload-gb, which offloads weights. Metrics: vllm:external_prefix_cache_queries/hits.",
+   "key_source": "https://docs.vllm.ai/en/latest/features/kv_offloading_usage.html; LMCache: Liu et al., CacheGen/CacheBlend, https://github.com/LMCache/LMCache"
+  },
+  {
+   "name": "KV-size-reducing architectures: MQA, GQA, MLA, sliding-window / hybrid attention",
+   "category": "Memory & KV cache",
+   "one_line": "Model-side designs that shrink KV per token. MQA/GQA share K/V heads across query heads; MLA (DeepSeek) caches a compressed latent; sliding-window or local layers keep only the last W tokens; hybrid SSM/linear layers keep fixed-size state.",
+   "bottleneck_addressed": "Memory capacity and decode bandwidth: KV bytes per token drop by roughly n_heads/n_kv_heads for GQA, by around 5-10x for MLA, and to a constant W for SWA layers.",
+   "tradeoff": "Fixed at training time, with possible quality cost. GQA limits useful TP (KV is duplicated once TP exceeds the number of KV heads). MLA needs dedicated kernels. SWA complicates prefix caching and offload.",
+   "vllm_support": "Automatic from the model config. MLA backends: FLASHMLA, FLASHINFER_MLA, CUTLASS_MLA, TRITON_MLA, FLASH_ATTN_MLA (+ sparse variants), plus --kv-cache-dtype fp8_ds_mla / nvfp4_ds_mla. SWA, hybrid and Mamba layers go through the hybrid KV cache manager (opt out with --disable-hybrid-kv-cache-manager); Mamba options include --mamba-cache-dtype and --enable-mamba-shared-prefix-checkpoint. When TP exceeds the KV-head count, use --decode-context-parallel-size to avoid duplicating KV.",
+   "key_source": "Shazeer 2019 (MQA, arXiv 1911.02150); Ainslie et al. 2023 (GQA, arXiv 2305.13245); DeepSeek-V2 (MLA, arXiv 2405.04434); https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager.html"
+  },
+  {
+   "name": "FlashAttention 2 / 3 / 4",
+   "category": "Compute kernels",
+   "one_line": "IO-aware tiled exact attention that never materialises the NxN score matrix. FA3 uses Hopper TMA/WGMMA, asynchrony and FP8; FA4 targets Blackwell (SM100+).",
+   "bottleneck_addressed": "Compute-bound prefill (FLOP utilisation) and HBM traffic. The paged varlen kernels also serve decode.",
+   "tradeoff": "Hardware-specific (FA3 = Hopper, FA4 = Blackwell), with limits on head-size and dtype support. FP8 attention can cost accuracy.",
+   "vllm_support": "--attention-backend FLASH_ATTN (auto-selected by default). Pick the version with --attention-config.flash_attn_version={2,3,4} (or -ac). Default: FA4 on SM100+, FA3 on SM90, FA2 otherwise. Other backends: TRITON_ATTN, FLEX_ATTENTION, ROCM_AITER_FA, etc.",
+   "key_source": "Dao, 'FlashAttention-2' (arXiv 2307.08691); Shah et al., 'FlashAttention-3' (arXiv 2407.08608); https://docs.vllm.ai/en/latest/design/attention_backends.html"
+  },
+  {
+   "name": "FlashInfer",
+   "category": "Compute kernels",
+   "one_line": "A kernel library for LLM serving: block-sparse/paged attention with JIT templates, load-balanced scheduling, cascade/shared-prefix attention, plus sampling, MoE and GEMM kernels (including Blackwell FP4/FP8).",
+   "bottleneck_addressed": "Memory-bound decode attention (paged KV reads) and kernel efficiency on new hardware; FP4/FP8 GEMM/MoE for compute-bound prefill.",
+   "tradeoff": "JIT compile and autotune warm-up time. Performance versus FA depends on GPU, shapes and features.",
+   "vllm_support": "--attention-backend FLASHINFER (and FLASHINFER_MLA, FLASHINFER_MLA_SPARSE*). --enable-flashinfer-autotune. --all2all-backend flashinfer_nvlink_two_sided for EP. FlashInfer is also used inside FP4/FP8 MoE and linear paths (--moe-backend / --linear-backend).",
+   "key_source": "Ye et al., 'FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving', MLSys 2025 (arXiv 2501.01005)"
+  },
+  {
+   "name": "CUDA graphs",
+   "category": "Compute kernels",
+   "one_line": "The model's kernel sequence is captured once per batch size and replayed with a single launch, removing per-kernel CPU launch overhead.",
+   "bottleneck_addressed": "CPU and launch overhead, which dominates small-batch, memory-bound decode.",
+   "tradeoff": "Extra GPU memory and startup capture time. Fixed shapes force padding to the captured sizes. Dynamic control flow is restricted, so piecewise graphs leave attention eager.",
+   "vllm_support": "On by default (O2: cudagraph_mode=FULL_AND_PIECEWISE). -cc.cudagraph_mode {NONE,PIECEWISE,FULL,FULL_DECODE_ONLY,FULL_AND_PIECEWISE}. --cudagraph-capture-sizes, --max-cudagraph-capture-size (capped at 512, or 1024 on DC Blackwell). --cudagraph-metrics. --enforce-eager disables graphs (and compile).",
+   "key_source": "https://docs.vllm.ai/en/latest/design/cuda_graphs.html"
+  },
+  {
+   "name": "torch.compile (vLLM compilation)",
+   "category": "Compute kernels",
+   "one_line": "The model is traced with Dynamo/Inductor once for dynamic shapes, auto-generating fused Triton kernels and running custom graph passes, then split into graph-capturable pieces.",
+   "bottleneck_addressed": "Memory bandwidth (fewer HBM round-trips through elementwise fusion) and kernel-launch count; helps both phases.",
+   "tradeoff": "Longer cold start (compile cache helps). Graph breaks with custom code. Harder to debug.",
+   "vllm_support": "--optimization-level O0..O3 (default O2). -cc / --compilation-config, e.g. -cc.mode {0 NONE,1 STOCK_TORCH_COMPILE,2 DYNAMO_TRACE_ONCE,3 VLLM_COMPILE}. VLLM_COMPILE is used at O2. --enforce-eager or O0 turns it off. --performance-mode {balanced,interactivity,throughput} presets.",
+   "key_source": "https://docs.vllm.ai/en/latest/design/torch_compile.html; Ansel et al., 'PyTorch 2', ASPLOS 2024"
+  },
+  {
+   "name": "Fused kernels (norm+quant, act+quant, RoPE+KV-write, allreduce+RMSNorm, fused MoE)",
+   "category": "Compute kernels",
+   "one_line": "Adjacent ops are merged into one kernel so intermediates stay in registers or SMEM. Examples: RMSNorm+FP8 quant, SiLU-mul+quant, QK-norm+RoPE+KV-cache write, AllReduce+RMSNorm, grouped/fused MoE GEMMs.",
+   "bottleneck_addressed": "Memory bandwidth (elementwise ops are bandwidth-bound) and launch overhead; communication overlap for TP.",
+   "tradeoff": "Kernels are tied to specific hardware, dtypes and layouts. Correctness risk, and harder to maintain.",
+   "vllm_support": "Applied automatically as compile passes at O2 (pass_config flags fuse_norm_quant, fuse_act_quant, fuse_attn_quant, fuse_allreduce_rms, fuse_rope_kvcache, fuse_qk_norm_rope_kvcache, fuse_rope_kvcache_cat_mla, fuse_mla_dual_rms_norm, fuse_act_padding), set via -cc.pass_config.<flag>=true|false. Kernel choice: --moe-backend, --linear-backend, --ir-op-priority.",
+   "key_source": "vllm/config/compilation.py PassConfig (v0.32.0); https://docs.vllm.ai/en/latest/design/fusions.html"
+  },
+  {
+   "name": "FP8 weight (and activation) quantisation",
+   "category": "Model compression",
+   "one_line": "Weights, and optionally activations, are stored and multiplied in FP8 E4M3 with per-tensor, per-channel or per-block scales, using native FP8 tensor cores on Ada, Hopper and Blackwell.",
+   "bottleneck_addressed": "Half the weight bytes (decode bandwidth and capacity). W8A8 also doubles tensor-core FLOPs for compute-bound prefill.",
+   "tradeoff": "Small accuracy loss. Dynamic activation scaling adds overhead. Full speedups need SM89+ hardware (older GPUs fall back to Marlin weight-only).",
+   "vllm_support": "Pre-quantised checkpoints (compressed-tensors / llm-compressor, modelopt) are auto-detected. Online: --quantization fp8, or the shorthands fp8_per_tensor / fp8_per_block / fp8_per_channel / mxfp8. Also modelopt_mxfp8 and deepseek_v4_fp8.",
+   "key_source": "Micikevicius et al., 'FP8 Formats for Deep Learning' (arXiv 2209.05433); https://docs.vllm.ai/en/latest/features/quantization/"
+  },
+  {
+   "name": "INT8 (W8A8 / weight-only INT8)",
+   "category": "Model compression",
+   "one_line": "8-bit integer weights, with SmoothQuant-style activation smoothing for W8A8, run on INT8 tensor cores. Useful on Ampere and Turing, which lack FP8.",
+   "bottleneck_addressed": "Weight bandwidth and capacity; INT8 GEMM throughput in prefill.",
+   "tradeoff": "Activation outliers need smoothing or calibration. FP8 is usually preferred on Hopper and later.",
+   "vllm_support": "compressed-tensors W8A8 INT8 checkpoints (llm-compressor) are auto-detected. Online --quantization int8_per_channel_weight_only. --quantization experts_int8 for MoE experts.",
+   "key_source": "Xiao et al., 'SmoothQuant' (arXiv 2211.10438); Dettmers et al., 'LLM.int8()' (arXiv 2208.07339)"
+  },
+  {
+   "name": "AWQ (activation-aware weight quantisation, INT4 W4A16)",
+   "category": "Model compression",
+   "one_line": "Before 4-bit group quantisation, the ~1% of weight channels that matter most (by activation magnitude) are protected by per-channel scaling.",
+   "bottleneck_addressed": "Decode bandwidth and capacity (~4x smaller weights).",
+   "tradeoff": "Weight-only, so it does not speed up compute-bound prefill (dequant overhead can even slow large batches). Some quality loss.",
+   "vllm_support": "--quantization awq | awq_marlin (Marlin kernel, auto-chosen when supported) | auto_awq. Checkpoints are usually auto-detected.",
+   "key_source": "Lin et al., 'AWQ', MLSys 2024 (arXiv 2306.00978); https://docs.vllm.ai/en/latest/features/quantization/auto_awq.html"
+  },
+  {
+   "name": "GPTQ (and generic INT4 W4A16 / W4A8)",
+   "category": "Model compression",
+   "one_line": "One-shot 2/3/4/8-bit post-training quantisation using approximate second-order (Hessian) error compensation, served through Marlin or Machete mixed-precision kernels.",
+   "bottleneck_addressed": "Decode bandwidth and capacity.",
+   "tradeoff": "Needs calibration data. Weight-only, so little prefill gain. Accuracy drops at 3 bits and below.",
+   "vllm_support": "--quantization gptq | gptq_marlin | auto_gptq. compressed-tensors W4A16 / W4A8 checkpoints are auto-detected. moe_wna16 for MoE.",
+   "key_source": "Frantar et al., 'GPTQ' (arXiv 2210.17323); https://docs.vllm.ai/en/latest/features/quantization/gptqmodel.html"
+  },
+  {
+   "name": "NVFP4 / MXFP4 (microscaled 4-bit floating point)",
+   "category": "Model compression",
+   "one_line": "4-bit E2M1 values with block scales: NVFP4 uses 16-element blocks with FP8 scales, MXFP4 uses 32-element blocks with E8M0 scales. They run natively on Blackwell FP4 tensor cores (W4A4).",
+   "bottleneck_addressed": "Both: ~4x weight bandwidth and capacity savings plus about 2x FP8 FLOPs for prefill (W4A4 on SM100+).",
+   "tradeoff": "Native speed only on Blackwell (Marlin emulation elsewhere). Accuracy relies on QAT or careful PTQ. MXFP4's coarser scales lose more quality than NVFP4.",
+   "vllm_support": "--quantization modelopt_fp4 (NVIDIA ModelOpt NVFP4), mxfp4, gpt_oss_mxfp4, modelopt_mixed, online nvfp4_per_token. compressed-tensors NVFP4 is auto-detected. NVFP4 KV: --kv-cache-dtype nvfp4.",
+   "key_source": "OCP Microscaling Formats (MX) Spec v1.0; NVIDIA, 'Introducing NVFP4' blog (2025); https://docs.vllm.ai/en/latest/features/quantization/modelopt.html"
+  },
+  {
+   "name": "Knowledge distillation",
+   "category": "Model compression",
+   "one_line": "A smaller student model is trained to match a larger teacher's logits or outputs, cutting parameters, FLOPs and bytes per token at inference.",
+   "bottleneck_addressed": "All of them, because the model is simply smaller: compute, bandwidth and capacity.",
+   "tradeoff": "Training cost, and the quality gap widens on hard tasks. It happens offline, not as a serving feature.",
+   "vllm_support": "vLLM has no flag for it (training-time technique); it serves distilled checkpoints like any model. vLLM can act as the teacher or generation backend for distillation data. Draft models and EAGLE heads for spec decoding are often distilled.",
+   "key_source": "Hinton et al., 'Distilling the Knowledge in a Neural Network' (arXiv 1503.02531)"
+  },
+  {
+   "name": "Speculative decoding: separate draft model",
+   "category": "Decoding acceleration",
+   "one_line": "A small draft LM proposes k tokens, the target verifies them in one forward pass, and rejection sampling keeps the output distribution exact.",
+   "bottleneck_addressed": "Memory-bandwidth-bound decode: each pass of the large model's weights yields several tokens.",
+   "tradeoff": "Draft compute and KV memory, with gains only when acceptance is high. Gains shrink or turn negative at high batch sizes (compute-bound). Draft and target need compatible tokenizers unless heterogeneous vocab is used.",
+   "vllm_support": "--speculative-config '{\"method\":\"draft_model\",\"model\":\"<draft>\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":1}' (or shorthand --spec-method / --spec-model / --spec-tokens). use_heterogeneous_vocab enables cross-vocab drafts. rejection_sample_method {standard,synthetic,block}.",
+   "key_source": "Leviathan et al., 'Fast Inference from Transformers via Speculative Decoding', ICML 2023 (arXiv 2211.17192); Chen et al. (arXiv 2302.01318); https://docs.vllm.ai/en/latest/features/speculative_decoding/"
+  },
+  {
+   "name": "N-gram / prompt-lookup and suffix decoding",
+   "category": "Decoding acceleration",
+   "one_line": "Draft tokens are copied from n-gram matches in the prompt and history (prompt lookup), or from a suffix tree over past outputs (suffix decoding). No draft model is needed.",
+   "bottleneck_addressed": "Memory-bandwidth-bound decode, on repetitive or copy-heavy outputs (code editing, RAG, summaries, agent loops).",
+   "tradeoff": "Almost free, but the speedup depends on the workload; on novel text it gives little. Wasted verification compute at large batch sizes.",
+   "vllm_support": "--speculative-config '{\"method\":\"ngram\",\"num_speculative_tokens\":4,\"prompt_lookup_min\":2,\"prompt_lookup_max\":5}'. method 'ngram_gpu' is the GPU-side variant. '{\"method\":\"suffix\",\"num_speculative_tokens\":8}' with suffix_decoding_max_tree_depth / _max_cached_requests / _max_spec_factor / _min_token_prob.",
+   "key_source": "Saxena, 'Prompt Lookup Decoding' (2023, github.com/apoorvumang/prompt-lookup-decoding); Oliaro et al., 'SuffixDecoding' (arXiv 2411.04975)"
+  },
+  {
+   "name": "Medusa",
+   "category": "Decoding acceleration",
+   "one_line": "Extra decoding heads on the target's last hidden state each predict token t+i, and tree attention verifies the candidates.",
+   "bottleneck_addressed": "Memory-bandwidth-bound decode.",
+   "tradeoff": "Heads must be trained per model. Acceptance is lower than EAGLE, which has largely superseded it.",
+   "vllm_support": "Still accepted as \"method\":\"medusa\" (also \"mlp_speculator\") in the v0.32.0 SpeculativeMethod enum, but no longer featured in the spec-decode docs (legacy). Prefer eagle3 or mtp.",
+   "key_source": "Cai et al., 'Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads', ICML 2024 (arXiv 2401.10774)"
+  },
+  {
+   "name": "EAGLE / EAGLE-3",
+   "category": "Decoding acceleration",
+   "one_line": "A lightweight autoregressive draft head runs at feature level on the target's hidden states; EAGLE-3 fuses low-, mid- and high-layer features and trains with training-time test. This gives high acceptance and roughly 2-6x decode speedup.",
+   "bottleneck_addressed": "Memory-bandwidth-bound decode.",
+   "tradeoff": "Needs a trained head per target model. Adds head compute and KV. Benefit falls at large batch sizes.",
+   "vllm_support": "--speculative-config '{\"method\":\"eagle3\",\"model\":\"<eagle3-head>\",\"num_speculative_tokens\":3}'; \"eagle\" (EAGLE-1/2 heads) is also accepted. Related: \"dflash\" and \"dspark\" draft methods. --per-request-spec-decode-metrics for acceptance stats.",
+   "key_source": "Li et al., 'EAGLE-3: Scaling up Inference Acceleration of LLMs via Training-Time Test' (arXiv 2503.01840); https://docs.vllm.ai/en/latest/features/speculative_decoding/eagle/"
+  },
+  {
+   "name": "MTP (multi-token prediction) speculative decoding",
+   "category": "Decoding acceleration",
+   "one_line": "The model's own native multi-token-prediction layers (DeepSeek-V3/V4, Qwen3-Next/3.5, GLM-4.5+, MiMo, Kimi K3, Gemma 4, ...) are reused as the drafter, with no external model.",
+   "bottleneck_addressed": "Memory-bandwidth-bound decode.",
+   "tradeoff": "Only for models trained with MTP. Extra layer weights and KV. Usually best at k of 1 to 3.",
+   "vllm_support": "--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":1}' (model is optional, since the MTP weights come from the target checkpoint). Model-specific types such as deepseek_mtp and qwen3_next_mtp are normalised. Gemma 4 assistant checkpoints use method mtp.",
+   "key_source": "Gloeckle et al., 'Better & Faster LLMs via Multi-token Prediction' (arXiv 2404.19737); DeepSeek-V3 Technical Report (arXiv 2412.19437)"
+  },
+  {
+   "name": "Tensor parallelism (TP)",
+   "category": "Parallelism",
+   "one_line": "Each layer's weight matrices are sharded across GPUs (column/row split) with all-reduce per layer. Every GPU works on every token.",
+   "bottleneck_addressed": "Memory capacity (weights and KV split) and per-token latency: aggregate HBM bandwidth helps decode, aggregate FLOPs help prefill.",
+   "tradeoff": "All-reduce on every layer needs NVLink-class interconnect, so it scales poorly across nodes. KV is duplicated once TP exceeds the KV-head count.",
+   "vllm_support": "--tensor-parallel-size / -tp (default 1). Custom all-reduce, and AllReduce+RMSNorm fusion via -cc.pass_config.fuse_allreduce_rms. --distributed-executor-backend {mp,ray,...}.",
+   "key_source": "Shoeybi et al., 'Megatron-LM' (arXiv 1909.08053); https://docs.vllm.ai/en/latest/serving/parallelism_scaling.html"
+  },
+  {
+   "name": "Pipeline parallelism (PP)",
+   "category": "Parallelism",
+   "one_line": "Contiguous layer ranges are placed on different GPUs or nodes, with micro-batches flowing through the stages.",
+   "bottleneck_addressed": "Memory capacity for models too large for one node; cheap point-to-point communication across nodes.",
+   "tradeoff": "Pipeline bubbles and higher per-token latency. Needs enough concurrent requests to fill the stages.",
+   "vllm_support": "--pipeline-parallel-size / -pp (default 1). Multi-node via --nnodes/-n, --node-rank/-r, --master-addr, --master-port, or Ray. Combining with spec decode requires vLLM > 0.15.",
+   "key_source": "Huang et al., 'GPipe' (arXiv 1811.06965); https://docs.vllm.ai/en/latest/serving/parallelism_scaling.html"
+  },
+  {
+   "name": "Data parallelism (DP replicas, incl. DP-attention)",
+   "category": "Parallelism",
+   "one_line": "Independent model replicas or engine ranks each serve their own requests. For MoE, DP attention plus EP experts avoids TP KV duplication.",
+   "bottleneck_addressed": "Throughput scaling (scheduling and capacity). Per-request latency does not change.",
+   "tradeoff": "Weights are replicated, so memory costs N times. Load balance and prefix locality across ranks matter. MoE DP ranks must step in lockstep.",
+   "vllm_support": "--data-parallel-size / -dp (default 1), --data-parallel-size-local, --data-parallel-rank, --data-parallel-start-rank, --data-parallel-address, --data-parallel-rpc-port, --data-parallel-backend {mp,ray}. LB modes: internal (default), --data-parallel-hybrid-lb, --data-parallel-external-lb, --data-parallel-multi-port-external-lb.",
+   "key_source": "https://docs.vllm.ai/en/latest/serving/data_parallel_deployment.html"
+  },
+  {
+   "name": "Expert parallelism (EP) for MoE",
+   "category": "Parallelism",
+   "one_line": "MoE experts are spread across GPUs and tokens are routed to them with all-to-all dispatch and combine. EPLB rebalances hot experts.",
+   "bottleneck_addressed": "Memory capacity (expert weights) and MoE compute and bandwidth efficiency at scale.",
+   "tradeoff": "All-to-all latency and network sensitivity. Expert load imbalance. Complex kernel and backend matrix (DeepEP, pplx, MoRI, NIXL-EP).",
+   "vllm_support": "--enable-expert-parallel / -ep (default off; usually combined with -dp or -tp). --all2all-backend {allgather_reducescatter (default), deepep_high_throughput, deepep_low_latency, deepep_v2, pplx, mori_*, moonep, nixl_ep, flashinfer_nvlink_two_sided, naive}. --enable-eplb with --eplb-config, --expert-placement-strategy, --enable-elastic-ep. --enable-dbo (dual-batch overlap) with --ubatch-size and --dbo-{decode,prefill}-token-threshold.",
+   "key_source": "Lepikhin et al., 'GShard' (arXiv 2006.16668); DeepSeek-V3 report; https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment.html"
+  },
+  {
+   "name": "Context / sequence parallelism (prefill CP, decode CP)",
+   "category": "Parallelism",
+   "one_line": "Work is sharded along the sequence dimension. Prefill CP splits a long prompt's queries (and K/V, ring-attention style) across GPUs; decode CP shards each request's KV cache across GPUs, interleaved by token.",
+   "bottleneck_addressed": "Long-context prefill compute (TTFT) and KV memory capacity and duplication during decode (when TP exceeds the KV-head count).",
+   "tradeoff": "Extra attention communication (all-gather, ring). Only some backends and models are supported. Gains only for long contexts.",
+   "vllm_support": "--prefill-context-parallel-size / -pcp (default 1). --decode-context-parallel-size / -dcp (default 1) with --dcp-kv-cache-interleave-size, --cp-kv-cache-interleave-size, --dcp-comm-backend, --dcp-q-replicate. Docs say prefill CP is still under active development. --enable-hc-sp is a separate sequence-parallel option.",
+   "key_source": "Liu et al., 'Ring Attention' (arXiv 2310.01889); https://docs.vllm.ai/en/latest/serving/context_parallel_deployment.html"
+  },
+  {
+   "name": "Disaggregated prefill/decode (PD disaggregation)",
+   "category": "Serving architecture",
+   "one_line": "Prefill and decode run on separate instance pools, and KV is transferred between them (NIXL/RDMA, Mooncake, etc.). Each pool gets its own parallelism and hardware and can be tuned for TTFT or ITL independently.",
+   "bottleneck_addressed": "Interference between compute-bound prefill and bandwidth-bound decode; also scheduling, through separate SLOs.",
+   "tradeoff": "KV transfer bandwidth and latency, a fast interconnect, a proxy or router, and the P:D ratio to tune. Ops complexity. Little win for short prompts.",
+   "vllm_support": "Experimental. --kv-transfer-config '{\"kv_connector\":\"NixlConnector\"|\"NixlPullConnector\"|\"NixlPushConnector\"|\"MooncakeConnector\"|\"MoRIIOConnector\"|\"LMCacheConnectorV1\",\"kv_role\":\"kv_producer\"|\"kv_consumer\"|\"kv_both\",\"kv_buffer_device\":\"cuda\"}'. Proxy: vllm-router --vllm-pd-disaggregation --prefill <url> --decode <url> (or llm-d / NVIDIA Dynamo). Encoder disaggregation: --ec-transfer-config.",
+   "key_source": "Zhong et al., 'DistServe', OSDI 2024 (arXiv 2401.09670); Patel et al., 'Splitwise' (arXiv 2311.18677); https://docs.vllm.ai/en/latest/features/disagg_prefill.html"
+  },
+  {
+   "name": "KV-aware / prefix-aware routing",
+   "category": "Serving architecture",
+   "one_line": "A gateway sends each request to the replica most likely to already hold its prefix KV, by hashing prompt prefixes or by consuming live KV-cache events, balanced against load.",
+   "bottleneck_addressed": "Prefill compute (cluster-wide prefix-cache hit rate) and load imbalance (scheduling).",
+   "tradeoff": "Affinity can create hotspots, so locality and load must be balanced. Approximate routers drift from real cache state, while precise routers need event plumbing.",
+   "vllm_support": "The engine publishes block-stored/removed events with --kv-events-config '{\"enable_kv_cache_events\":true,\"publisher\":\"zmq\",...}' (offload tiers too). vllm-router --policy {cache_aware,consistent_hash,power_of_two,round_robin,random}. External: llm-d inference scheduler (precise prefix-cache scorer), NVIDIA Dynamo KV router, vLLM production-stack router.",
+   "key_source": "https://github.com/vllm-project/router; llm-d docs https://llm-d.ai; Preble (Srivatsa et al., arXiv 2407.00023)"
+  },
+  {
+   "name": "Multi-LoRA serving",
+   "category": "Serving architecture",
+   "one_line": "Many LoRA adapters are served on one base model in the same batch, using batched gather-matmul kernels (Punica SGMV/BGMV) and an adapter cache in GPU and CPU memory.",
+   "bottleneck_addressed": "Memory capacity and cost: one base model instead of N fine-tuned copies; scheduling across tenants.",
+   "tradeoff": "Kernel overhead grows with rank and with the number of distinct adapters per batch. GPU adapter slots limit concurrency. Adapter swap latency.",
+   "vllm_support": "--enable-lora, --max-loras (GPU slots, default 1), --max-lora-rank (default 16), --max-cpu-loras, --fully-sharded-loras, --lora-target-modules, --lora-dtype, --specialize-active-lora, --enable-moe-shared-loras. Static: --lora-modules name=path. Dynamic: VLLM_ALLOW_RUNTIME_LORA_UPDATING=True with POST /v1/load_lora_adapter and /v1/unload_lora_adapter.",
+   "key_source": "Chen et al., 'Punica' (arXiv 2310.18547); Sheng et al., 'S-LoRA' (arXiv 2311.03285); https://docs.vllm.ai/en/latest/features/lora.html"
+  },
+  {
+   "name": "Autoscaling on queue / KV metrics",
+   "category": "Serving architecture",
+   "one_line": "Replicas are scaled on inference-aware signals (waiting queue depth, KV-cache utilisation, TTFT/ITL SLOs) rather than CPU or GPU utilisation, which says little about LLM load.",
+   "bottleneck_addressed": "Scheduling and capacity at cluster level: queueing delay and preemption under bursty load.",
+   "tradeoff": "Cold starts are slow (weights load, compile, CUDA-graph capture), so scaling lags. Thresholds risk flapping. Scale-down evicts warm prefix caches.",
+   "vllm_support": "No built-in autoscaler. vLLM exports Prometheus /metrics such as vllm:num_requests_waiting, vllm:num_requests_running, vllm:kv_cache_usage_perc, vllm:num_preemptions and TTFT/ITL histograms for KEDA or HPA, the vLLM production-stack, llm-d (workload-variant autoscaler), KServe, Ray Serve or Dynamo planner. Faster cold starts: sleep mode (--enable-sleep-mode), compile cache, --load-format options.",
+   "key_source": "https://docs.vllm.ai/en/latest/design/metrics.html; https://docs.vllm.ai/projects/production-stack"
+  }
+ ]
+}
