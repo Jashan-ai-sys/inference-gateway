@@ -71,3 +71,28 @@ async def test_poll_once_updates_stats_and_survives_errors(cfg):
     async with httpx.AsyncClient(transport=broken) as client:
         await poll_once(client, backend, h)
     assert h.stats.running == 5.0  # last good reading kept
+
+
+def test_parse_skips_non_numeric_and_non_finite_values():
+    stats = parse_vllm_metrics(
+        "vllm:num_requests_running abc\n"
+        "vllm:num_requests_waiting NaN\n"
+        "vllm:kv_cache_usage_perc 0.5\n"
+    )
+    assert (stats.running, stats.waiting, stats.kv_usage) == (0.0, 0.0, 0.5)
+
+
+@pytest.mark.parametrize("exc", [httpx.ConnectError("refused"), httpx.InvalidURL("bad url")])
+async def test_poll_once_keeps_last_good_reading_on_transport_error(cfg, exc):
+    backend = cfg.backend_by_name("sim-strong")
+    h = BackendHealth(backend)
+    ok = httpx.MockTransport(lambda r: httpx.Response(200, text=SAMPLE))
+    async with httpx.AsyncClient(transport=ok) as client:
+        await poll_once(client, backend, h)
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise exc
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(boom)) as client:
+        await poll_once(client, backend, h)
+    assert h.stats.running == 5.0

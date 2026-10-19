@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -10,6 +11,17 @@ import httpx
 from gateway.config import BackendConfig
 
 _SAMPLE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(\S+)")
+_GAUGES = frozenset(
+    ("vllm:num_requests_running", "vllm:num_requests_waiting", "vllm:kv_cache_usage_perc")
+)
+
+
+def _finite(raw: str) -> float | None:
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
 
 
 @dataclass
@@ -28,7 +40,12 @@ def parse_vllm_metrics(text: str) -> EngineStats:
         match = _SAMPLE.match(line)
         if not match:
             continue
-        name, value = match.group(1), float(match.group(3))
+        name = match.group(1)
+        if name not in _GAUGES:
+            continue
+        value = _finite(match.group(3))
+        if value is None:
+            continue
         if name == "vllm:num_requests_running":
             stats.running += value
         elif name == "vllm:num_requests_waiting":
@@ -91,6 +108,6 @@ async def poll_once(
     try:
         response = await client.get(backend.metrics_url, timeout=2.0)
         response.raise_for_status()
-    except httpx.HTTPError:
+    except (httpx.HTTPError, httpx.InvalidURL):
         return
     health.stats = parse_vllm_metrics(response.text)
