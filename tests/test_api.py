@@ -4,7 +4,13 @@ import httpx
 
 from gateway.api import create_app
 from gateway.engine import Engine
-from tests.conftest import mock_transport, only_backends, sse_response, with_class
+from tests.conftest import (
+    mock_transport,
+    only_backends,
+    sse_response,
+    with_backend,
+    with_class,
+)
 
 AUTH_A = {"Authorization": "Bearer key-a"}
 BODY = {"messages": [{"role": "user", "content": "hello"}], "max_tokens": 16}
@@ -29,6 +35,14 @@ async def gateway(
 async def test_rejects_unknown_key(cfg):
     async with gateway(cfg) as (client, _):
         response = await client.post("/v1/chat/completions", json=BODY)
+    assert response.status_code == 401
+
+
+async def test_rejects_bare_key_without_bearer_scheme(cfg):
+    async with gateway(cfg) as (client, _):
+        response = await client.post(
+            "/v1/chat/completions", json=BODY, headers={"Authorization": "key-a"}
+        )
     assert response.status_code == 401
 
 
@@ -85,11 +99,48 @@ async def test_upstream_failure_maps_to_status(cfg):
     assert response.status_code == 502
 
 
-async def test_metrics_and_health(cfg):
+async def test_metrics_and_health(cfg, monkeypatch):
+    monkeypatch.setenv("GW_METRICS_TOKEN", "ops-token")
     async with gateway(only_backends(cfg, "sim-strong")) as (client, _):
         await client.post("/v1/chat/completions", json=BODY, headers=AUTH_A)
-        metrics = await client.get("/metrics")
+        metrics = await client.get("/metrics", headers={"Authorization": "Bearer ops-token"})
+        tenant_key = await client.get("/metrics", headers=AUTH_A)
+        anonymous = await client.get("/metrics")
         health = await client.get("/healthz")
     sample = 'gateway_requests_total{backend="sim-strong",cls="standard",outcome="ok"} 1.0'
     assert sample in metrics.text  # exposition sorts labels alphabetically
-    assert health.json() == {"status": "ok", "backends": ["sim-strong"]}
+    assert tenant_key.status_code == 401 and anonymous.status_code == 401
+    assert health.json() == {"status": "ok"}
+
+
+async def test_metrics_disabled_without_token(cfg, monkeypatch):
+    monkeypatch.delenv("GW_METRICS_TOKEN", raising=False)
+    async with gateway(cfg) as (client, _):
+        response = await client.get("/metrics", headers=AUTH_A)
+    assert response.status_code == 404
+
+
+async def test_streaming_upstream_failure_maps_to_status(cfg):
+    async with gateway(only_backends(cfg, "sim-strong"), chat=lambda r: httpx.Response(500)) as (
+        client,
+        _,
+    ):
+        response = await client.post(
+            "/v1/chat/completions", json={**BODY, "stream": True}, headers=AUTH_A
+        )
+    assert response.status_code == 502
+
+
+async def test_streaming_deadline_expiry_maps_to_503(cfg):
+    cfg = with_class(
+        with_backend(only_backends(cfg, "sim-strong"), "sim-strong", max_in_flight=0),
+        "interactive",
+        ttft_target_s=0.3,
+    )
+    async with gateway(cfg) as (client, _):
+        response = await client.post(
+            "/v1/chat/completions",
+            json={**BODY, "stream": True},
+            headers={"Authorization": "Bearer key-b"},
+        )
+    assert response.status_code == 503
