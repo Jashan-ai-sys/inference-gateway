@@ -283,3 +283,29 @@ async def test_slow_long_prompt_does_not_lock_out_interactive_requests(cfg):
         await engine.stop()
     assert engine.health["sim-strong"].base_ttft() == pytest.approx(0.2)
     assert short.req.backend == "sim-strong"
+
+
+async def test_open_circuit_stops_dispatching_queued_work(cfg):
+    cfg = only_backends(with_backend(cfg, "sim-strong", max_in_flight=1), "sim-strong")
+    clock = FakeClock()
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(transport=mock_transport(handler)) as c:
+        engine = Engine(cfg, c, clock=clock)
+        threshold = engine.health["sim-strong"].failure_threshold
+        jobs = [engine.submit(make_request(cfg, now=clock())) for _ in range(threshold + 2)]
+        await engine.start()
+        failed = [(await drain(job))[-1] for job in jobs[:threshold]]
+        await asyncio.sleep(0.1)  # several ticks with the breaker open
+        assert len(calls) == threshold
+        assert all(job.out.empty() for job in jobs[threshold:])
+        clock.advance(6.0)  # past the standard 5 s deadline, breaker still open
+        expired = [(await drain(job))[-1] for job in jobs[threshold:]]
+        await engine.stop()
+    assert all(isinstance(f, Failed) and f.status == 502 for f in failed)
+    assert all(isinstance(f, Failed) and f.status == 503 for f in expired)
+    assert len(calls) == threshold

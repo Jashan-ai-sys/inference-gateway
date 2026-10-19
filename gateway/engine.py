@@ -172,7 +172,11 @@ class Engine:
             self._reroute_at_risk(name, scheduler, now)
             for req in scheduler.expire(now):
                 self._expire(req)
-            while (req := scheduler.next_admissible(now)) is not None:
+            # An open circuit holds queued work; aging, re-routes and expiry above still run.
+            while (
+                self.health[name].available(now)
+                and (req := scheduler.next_admissible(now)) is not None
+            ):
                 job = self.jobs.get(req.id)
                 if job is None or job.finished:
                     scheduler.release(req)
