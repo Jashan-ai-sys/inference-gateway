@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 import httpx
@@ -144,3 +145,39 @@ async def test_streaming_deadline_expiry_maps_to_503(cfg):
             headers={"Authorization": "Bearer key-b"},
         )
     assert response.status_code == 503
+
+
+async def test_backend_header_reports_the_backend_after_a_reroute(cfg):
+    """sim-strong wins routing but cannot admit; at aging_fraction of the 1 s target the
+    request moves to sim-small, and the headers must name sim-small."""
+    cfg = only_backends(cfg, "sim-strong", "sim-small")
+    cfg = with_backend(cfg, "sim-strong", max_in_flight=0, base_ttft_s=0.1)
+    cfg = with_backend(cfg, "sim-small", base_ttft_s=0.3, prefill_tokens_per_s=4000)
+    interactive = {"Authorization": "Bearer key-b"}
+    async with gateway(cfg) as (client, engine):
+        collected, streamed = await asyncio.gather(
+            client.post("/v1/chat/completions", json=BODY, headers=interactive),
+            client.post("/v1/chat/completions", json={**BODY, "stream": True}, headers=interactive),
+        )
+        reroutes = engine.metrics.registry.get_sample_value(
+            "gateway_reroutes_total", {"cls": "interactive"}
+        )
+    assert reroutes == 2
+    assert collected.status_code == streamed.status_code == 200
+    assert collected.headers["x-gateway-backend"] == "sim-small"
+    assert streamed.headers["x-gateway-backend"] == "sim-small"
+
+
+async def test_pre_chunk_errors_carry_gateway_headers(cfg):
+    async with gateway(only_backends(cfg, "sim-strong"), chat=lambda r: httpx.Response(500)) as (
+        client,
+        _,
+    ):
+        collected = await client.post("/v1/chat/completions", json=BODY, headers=AUTH_A)
+        streamed = await client.post(
+            "/v1/chat/completions", json={**BODY, "stream": True}, headers=AUTH_A
+        )
+    for response in (collected, streamed):
+        assert response.status_code == 502
+        assert response.headers["x-gateway-backend"] == "sim-strong"
+        assert response.headers["x-gateway-class"] == "standard"

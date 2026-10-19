@@ -55,6 +55,11 @@ def _error(status: int, message: str, headers: dict | None = None) -> JSONRespon
     )
 
 
+def _gateway_headers(job: Job) -> dict:
+    """Read after the first output: a re-route can change the backend while the job is queued."""
+    return {"X-Gateway-Backend": job.req.backend, "X-Gateway-Class": job.req.cls.name}
+
+
 def create_app(cfg: GatewayConfig, engine: Engine) -> FastAPI:
     keys = tenant_keys(cfg)
 
@@ -102,10 +107,9 @@ def create_app(cfg: GatewayConfig, engine: Engine) -> FastAPI:
             return _error(exc.status, f"{exc}: {exc.rejected}")
         except QueueFull as exc:
             return _error(429, str(exc), {"Retry-After": "1"})
-        headers = {"X-Gateway-Backend": req.backend, "X-Gateway-Class": req.cls.name}
         if req.stream:
-            return await _stream(engine, job, http, headers)
-        return await _collect(engine, job, http, headers)
+            return await _stream(engine, job, http)
+        return await _collect(engine, job, http)
 
     return app
 
@@ -121,7 +125,7 @@ async def _next_item(engine: Engine, job: Job, http: HttpRequest):
                 return None
 
 
-async def _stream(engine: Engine, job: Job, http: HttpRequest, headers: dict) -> Response:
+async def _stream(engine: Engine, job: Job, http: HttpRequest) -> Response:
     # Wait for the first item so failures before any output get a real HTTP status.
     try:
         first = await _next_item(engine, job, http)
@@ -131,9 +135,9 @@ async def _stream(engine: Engine, job: Job, http: HttpRequest, headers: dict) ->
     if first is None:
         return Response(status_code=499)
     if isinstance(first, Failed):
-        return _error(first.status, first.message)
+        return _error(first.status, first.message, _gateway_headers(job))
     return StreamingResponse(
-        _sse(engine, job, first), media_type="text/event-stream", headers=headers
+        _sse(engine, job, first), media_type="text/event-stream", headers=_gateway_headers(job)
     )
 
 
@@ -153,7 +157,7 @@ async def _sse(engine: Engine, job: Job, item):
         engine.cancel(job)  # no-op once finished; closes upstream if the client disconnected
 
 
-async def _collect(engine: Engine, job: Job, http: HttpRequest, headers: dict) -> Response:
+async def _collect(engine: Engine, job: Job, http: HttpRequest) -> Response:
     content: list[str] = []
     finish, usage, model = None, None, None
     try:
@@ -162,7 +166,7 @@ async def _collect(engine: Engine, job: Job, http: HttpRequest, headers: dict) -
             if item is None:
                 return Response(status_code=499)
             if isinstance(item, Failed):
-                return _error(item.status, item.message)
+                return _error(item.status, item.message, _gateway_headers(job))
             if isinstance(item, Done):
                 break
             model = item.get("model", model)
@@ -196,5 +200,5 @@ async def _collect(engine: Engine, job: Job, http: HttpRequest, headers: dict) -
             ],
             "usage": usage,
         },
-        headers=headers,
+        headers=_gateway_headers(job),
     )
