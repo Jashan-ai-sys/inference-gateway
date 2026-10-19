@@ -6,7 +6,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0
       - run: uv sync
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -17,7 +17,7 @@ jobs:
     needs: unit
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0
       - run: uv sync
       - run: docker compose -f docker-compose.sim.yml up -d
       - name: Wait for simulators
