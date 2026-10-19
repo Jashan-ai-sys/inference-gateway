@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from gateway.config import ClassConfig, GatewayConfig, TenantConfig
 
 # Client fields that go upstream. Anything else (model, priority, stream, max_tokens, ...) is
-# dropped: the dispatcher sets those, or the gateway consumes them.
+# dropped: the dispatcher sets those, or the gateway consumes them. Tool calls and logprobs are
+# dropped too until non-streaming responses reassemble them (out of v1 scope).
 FORWARDED_FIELDS = frozenset(
     {
         "messages",
@@ -19,11 +20,6 @@ FORWARDED_FIELDS = frozenset(
         "presence_penalty",
         "frequency_penalty",
         "response_format",
-        "tools",
-        "tool_choice",
-        "parallel_tool_calls",
-        "logprobs",
-        "top_logprobs",
         "user",
     }
 )

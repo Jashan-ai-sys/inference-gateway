@@ -37,6 +37,11 @@ def test_gateway_fields_are_stripped_from_forwarded_body(cfg):
         model="evil-model",
         priority=-100,
         n=1,
+        tools=[{"type": "function", "function": {"name": "f"}}],
+        tool_choice="auto",
+        parallel_tool_calls=True,
+        logprobs=True,
+        top_logprobs=2,
     )
     req = analyze(body, _tenant(cfg, "tenant-a"), cfg, approx_tokens, 0, "r")
     assert req.task_type == "code" and req.session_id == "s1"
