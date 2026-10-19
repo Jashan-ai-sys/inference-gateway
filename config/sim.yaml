@@ -1,0 +1,88 @@
+# Local development against llm-d-inference-sim (docker-compose.sim.yml).
+# Performance priors (prefill/throughput/base TTFT) are placeholders; Plan 3 replaces them with
+# M0 measurements. Self-hosted prices are 0 here; the GPU config sets amortised $/token.
+scheduling: gateway
+routing: adaptive
+aging_fraction: 0.5
+kv_headroom: 0.9
+decision_log: null
+
+classes:
+  - name: interactive
+    rank: 0
+    ttft_target_s: 1.0
+    tpot_target_s: 0.1
+    queue_limit: 64
+    output_p90: 300
+    timeout_s: 60
+    vllm_priority: 0
+    weights: {cost: 0.1, latency: 0.6, quality_risk: 0.2, error_rate: 0.1}
+  - name: standard
+    rank: 1
+    ttft_target_s: 5.0
+    tpot_target_s: 0.15
+    queue_limit: 256
+    output_p90: 800
+    timeout_s: 300
+    vllm_priority: 1
+    weights: {cost: 0.3, latency: 0.3, quality_risk: 0.3, error_rate: 0.1}
+  - name: background
+    rank: 2
+    ttft_target_s: 60.0
+    tpot_target_s: 0.5
+    queue_limit: 1024
+    output_p90: 2000
+    timeout_s: 1200
+    vllm_priority: 2
+    weights: {cost: 0.6, latency: 0.1, quality_risk: 0.2, error_rate: 0.1}
+
+backends:
+  - name: sim-strong
+    kind: vllm
+    base_url: http://localhost:8001/v1
+    metrics_url: http://localhost:8001/metrics
+    model: Qwen/Qwen3-8B-AWQ
+    context_limit: 8192
+    quality: {chat: 0.8, code: 0.75, math: 0.7}
+    kv_capacity_tokens: 37000
+    max_in_flight: 8
+    prefill_tokens_per_s: 4000
+    throughput_tokens_per_s: 600
+    base_ttft_s: 0.2
+    extra_body: {chat_template_kwargs: {enable_thinking: false}}
+  - name: sim-small
+    kind: vllm
+    base_url: http://localhost:8002/v1
+    metrics_url: http://localhost:8002/metrics
+    model: Qwen/Qwen3-1.7B
+    context_limit: 8192
+    quality: {chat: 0.6, code: 0.45, math: 0.4}
+    kv_capacity_tokens: 24000
+    max_in_flight: 16
+    prefill_tokens_per_s: 12000
+    throughput_tokens_per_s: 1500
+    base_ttft_s: 0.1
+    extra_body: {chat_template_kwargs: {enable_thinking: false}}
+  - name: groq-gpt-oss-20b
+    kind: hosted
+    base_url: https://api.groq.com/openai/v1
+    model: openai/gpt-oss-20b
+    api_key_env: GROQ_API_KEY
+    context_limit: 131072
+    price_in_per_m: 0.075
+    price_out_per_m: 0.30
+    quality: {chat: 0.75, code: 0.7, math: 0.75}
+    allows_sensitive: true
+    max_in_flight: 8
+    rpm: 30
+    tpm: 8000
+    prefill_tokens_per_s: 50000
+    throughput_tokens_per_s: 1000
+    base_ttft_s: 0.35
+
+tenants:
+  - {name: tenant-a, api_key_env: GW_KEY_A, allowed_classes: [interactive, standard, background], default_class: standard}
+  - {name: tenant-b, api_key_env: GW_KEY_B, allowed_classes: [interactive, standard, background], default_class: interactive}
+  - {name: tenant-c, api_key_env: GW_KEY_C, allowed_classes: [standard, background], default_class: background, sensitive: true}
+
+static_routes: {chat: sim-small, code: sim-strong, math: sim-strong}
