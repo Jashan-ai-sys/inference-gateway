@@ -160,7 +160,7 @@ async def test_backend_header_reports_the_backend_after_a_reroute(cfg):
             client.post("/v1/chat/completions", json={**BODY, "stream": True}, headers=interactive),
         )
         reroutes = engine.metrics.registry.get_sample_value(
-            "gateway_reroutes_total", {"cls": "interactive"}
+            "gateway_reroutes_total", {"cls": "interactive", "backend": "sim-small"}
         )
     assert reroutes == 2
     assert collected.status_code == streamed.status_code == 200
@@ -181,3 +181,14 @@ async def test_pre_chunk_errors_carry_gateway_headers(cfg):
         assert response.status_code == 502
         assert response.headers["x-gateway-backend"] == "sim-strong"
         assert response.headers["x-gateway-class"] == "standard"
+
+
+async def test_no_backend_capacity_429_has_retry_after_and_permanent_400_does_not(cfg):
+    cfg = only_backends(cfg, "sim-strong")
+    too_long = {**BODY, "messages": [{"role": "user", "content": "x" * 40000}]}
+    async with gateway(cfg) as (client, engine):
+        permanent = await client.post("/v1/chat/completions", json=too_long, headers=AUTH_A)
+        engine.health["sim-strong"].open_until = engine.clock() + 100
+        capacity = await client.post("/v1/chat/completions", json=BODY, headers=AUTH_A)
+    assert permanent.status_code == 400 and "retry-after" not in permanent.headers
+    assert capacity.status_code == 429 and capacity.headers["retry-after"] == "1"

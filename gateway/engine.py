@@ -109,6 +109,7 @@ class Engine:
         if self.cfg.scheduling == "passthrough":
             self.jobs[req.id] = job
             scheduler.admit(req, self.clock())
+            self._count_overflow(req)
             self._log_decision(req, decision, None)
             self._launch(job)
             return job
@@ -119,6 +120,7 @@ class Engine:
             self._log_decision(req, None, "queue_full", {})
             raise
         self.jobs[req.id] = job
+        self._count_overflow(req)
         self._log_decision(req, decision, None)
         self._wake.set()
         return job
@@ -148,11 +150,16 @@ class Engine:
                 self.clock(),
             )
         except NoBackend as exc:
-            self.metrics.rejections.labels(req.cls.name, "no_backend").inc()
+            reason = "no_backend_permanent" if exc.status == 400 else "no_backend_capacity"
+            self.metrics.rejections.labels(req.cls.name, reason).inc()
             self._log_decision(req, None, str(exc), exc.rejected)
             raise
         req.backend = decision.backend
         return decision
+
+    def _count_overflow(self, req: Request) -> None:
+        if self.backends[req.backend].kind == "hosted":
+            self.metrics.overflows.labels(req.cls.name, req.backend).inc()
 
     async def _dispatch_loop(self) -> None:
         while True:
@@ -204,7 +211,8 @@ class Engine:
             scheduler.remove(req)
             req.backend = decision.backend
             self.schedulers[decision.backend].requeue_front(req)
-            self.metrics.reroutes.labels(req.cls.name).inc()
+            self.metrics.reroutes.labels(req.cls.name, req.backend).inc()
+            self._count_overflow(req)
             self._log_decision(req, decision, None)
             self._wake.set()
 
@@ -217,6 +225,7 @@ class Engine:
         job.out.put_nowait(Failed(503, "deadline exceeded while queued"))
 
     def _launch(self, job: Job) -> None:
+        self.metrics.admits.labels(job.req.cls.name, job.req.backend).inc()
         task = asyncio.create_task(self._run(job))
         job.task = task
         task.add_done_callback(lambda _: self._cleanup(job, task))
@@ -238,6 +247,7 @@ class Engine:
         if not job.prompt_charged:
             job.prompt_charged = True
             self.vtc.charge_prompt(req.tenant, req.prompt_tokens)
+            self._vtc_charged(req.tenant)
 
         async def on_chunk(chunk: dict) -> None:
             nonlocal streamed
@@ -245,6 +255,7 @@ class Engine:
             if n:
                 streamed += n
                 self.vtc.charge_output(req.tenant, n)
+                self._vtc_charged(req.tenant)
             await job.out.put(chunk)
 
         try:
@@ -277,11 +288,15 @@ class Engine:
         else:
             if result.output_tokens > streamed:
                 self.vtc.charge_output(req.tenant, result.output_tokens - streamed)
+                self._vtc_charged(req.tenant)
             self._finish(job, result)
         finally:
             self._cleanup(
                 job, asyncio.current_task()
             )  # idempotent; the callback covers early cancel
+
+    def _vtc_charged(self, tenant: str) -> None:
+        self.metrics.vtc_counter.labels(tenant).set(self.vtc.counter(tenant))
 
     def _finish(self, job: Job, result: StreamResult) -> None:
         req = job.req

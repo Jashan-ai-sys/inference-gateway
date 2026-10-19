@@ -104,7 +104,8 @@ def create_app(cfg: GatewayConfig, engine: Engine) -> FastAPI:
         try:
             job = engine.submit(req)
         except NoBackend as exc:
-            return _error(exc.status, f"{exc}: {exc.rejected}")
+            retry = {"Retry-After": "1"} if exc.status == 429 else None
+            return _error(exc.status, f"{exc}: {exc.rejected}", retry)
         except QueueFull as exc:
             return _error(429, str(exc), {"Retry-After": "1"})
         if req.stream:

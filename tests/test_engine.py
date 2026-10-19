@@ -40,6 +40,10 @@ async def test_passthrough_streams_and_accounts(cfg):
         "gateway_requests_total", {"cls": "standard", "backend": "sim-strong", "outcome": "ok"}
     )
     assert sample == 1.0
+    labels = {"cls": "standard", "backend": "sim-strong"}
+    assert engine.metrics.registry.get_sample_value("gateway_admits_total", labels) == 1.0
+    vtc = engine.metrics.registry.get_sample_value("gateway_vtc_counter", {"tenant": "tenant-a"})
+    assert vtc == 100 + 2 * 2
 
 
 async def test_quiet_tenant_is_not_starved_by_noisy_tenant(cfg):
@@ -154,6 +158,10 @@ async def test_at_risk_interactive_request_is_rerouted_once(cfg):
         assert job.req.backend == "sim-small" and job.req.rerouted
         items = await drain(job)
     assert isinstance(items[-1], Done)
+    reroutes = engine.metrics.registry.get_sample_value(
+        "gateway_reroutes_total", {"cls": "interactive", "backend": "sim-small"}
+    )
+    assert reroutes == 1.0
 
 
 def test_queue_full_is_raised_and_nothing_is_left_behind(cfg):
@@ -309,3 +317,36 @@ async def test_open_circuit_stops_dispatching_queued_work(cfg):
     assert all(isinstance(f, Failed) and f.status == 502 for f in failed)
     assert all(isinstance(f, Failed) and f.status == 503 for f in expired)
     assert len(calls) == threshold
+
+
+async def test_no_backend_rejections_split_permanent_and_capacity(cfg):
+    from gateway.router import NoBackend
+
+    cfg = only_backends(cfg, "sim-strong")
+    async with httpx.AsyncClient() as c:
+        engine = Engine(cfg, c)
+        with pytest.raises(NoBackend):
+            engine.submit(make_request(cfg, prompt=10000, now=engine.clock()))
+        engine.health["sim-strong"].open_until = engine.clock() + 100
+        with pytest.raises(NoBackend):
+            engine.submit(make_request(cfg, now=engine.clock()))
+    for reason in ("no_backend_permanent", "no_backend_capacity"):
+        sample = engine.metrics.registry.get_sample_value(
+            "gateway_rejections_total", {"cls": "standard", "reason": reason}
+        )
+        assert sample == 1.0
+
+
+async def test_placement_on_hosted_backend_counts_as_overflow(cfg, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "x")
+    cfg = only_backends(cfg, "sim-strong", "groq-gpt-oss-20b")
+    cfg = with_backend(cfg, "sim-strong", quality={"chat": 0.1})
+    cfg = with_class(cfg, "standard", min_quality=0.5)
+    async with httpx.AsyncClient() as c:
+        engine = Engine(cfg, c)
+        job = engine.submit(make_request(cfg, now=engine.clock()))
+    assert job.req.backend == "groq-gpt-oss-20b"
+    labels = {"cls": "standard", "backend": "groq-gpt-oss-20b"}
+    assert engine.metrics.registry.get_sample_value("gateway_overflows_total", labels) == 1.0
+    local = {"cls": "standard", "backend": "sim-strong"}
+    assert engine.metrics.registry.get_sample_value("gateway_overflows_total", local) is None

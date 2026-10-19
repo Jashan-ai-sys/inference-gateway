@@ -60,7 +60,14 @@ class GatewayMetrics:
         )
         self.queue_depth = Gauge("gateway_queue_depth", "Queued requests", by_cls, registry=r)
         self.reroutes = Counter(
-            "gateway_reroutes", "Re-routes of at-risk requests", ["cls"], registry=r
+            "gateway_reroutes", "Re-routes of at-risk requests, by target", by_cls, registry=r
+        )
+        self.admits = Counter("gateway_admits", "Requests dispatched upstream", by_cls, registry=r)
+        self.overflows = Counter(
+            "gateway_overflows", "Requests placed on a hosted backend", by_cls, registry=r
+        )
+        self.vtc_counter = Gauge(
+            "gateway_vtc_counter", "VTC weighted tokens served", ["tenant"], registry=r
         )
 
     def record_finished(self, req: Request, result: StreamResult, backend: BackendConfig) -> bool:
