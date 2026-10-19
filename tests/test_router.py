@@ -145,3 +145,12 @@ def test_passthrough_does_not_shed_on_predicted_deadline(cfg):
     decision = decide(cfg, make_request(cfg, cls="interactive"))
     assert decision.backend == "sim-strong"
     assert decision.candidates[0].predicted_ttft > 100.0
+
+
+def test_saturated_backend_pays_its_pause_in_predicted_ttft(cfg):
+    cfg = only_backends(cfg, "sim-strong", "sim-small")
+    st = state(cfg)
+    st[1]["sim-small"].saturated_until = 5.0  # e.g. Retry-After: 5 after a 429 at t=0
+    decision = decide(cfg, make_request(cfg, cls="interactive"), st=st)
+    assert decision.backend == "sim-strong"
+    assert decision.rejected == {"sim-small": "deadline"}

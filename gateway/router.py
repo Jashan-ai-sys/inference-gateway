@@ -109,7 +109,8 @@ def route(
             continue
         uncached = uncached_tokens(req, name, sessions)
         ttft = (
-            scheduler.queue_wait(req.rank)
+            max(0.0, scheduler.saturated_until - now)  # paused after a 429/503 from the backend
+            + scheduler.queue_wait(req.rank)
             + uncached / backend.prefill_tokens_per_s
             + health[name].base_ttft()
         )
