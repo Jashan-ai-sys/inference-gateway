@@ -57,21 +57,24 @@ async def test_gateway_streams_through_simulator(cfg):
 
 
 @pytest.mark.xfail(
-    reason="llm-d-inference-sim does not abort on disconnect; checked on real vLLM in Plan 3"
+    raises=AssertionError,
+    reason="llm-d-inference-sim does not abort on disconnect; checked on real vLLM in Plan 3",
 )
 async def test_cancel_frees_the_simulator_slot(cfg):
     cfg = only_backends(cfg.model_copy(update={"scheduling": "passthrough"}), "sim-strong")
     engine = Engine(cfg, httpx.AsyncClient(timeout=httpx.Timeout(60.0)))
-    job = engine.submit(make_request(cfg, max_tokens=2000, now=engine.clock()))
-    await asyncio.wait_for(job.out.get(), 10)  # first chunk
-    assert await _running(8001) >= 1
-    engine.cancel(job)
-    for _ in range(50):
-        if await _running(8001) == 0:
-            break
-        await asyncio.sleep(0.1)
-    await engine.stop()
-    await engine.client.aclose()
+    try:
+        job = engine.submit(make_request(cfg, max_tokens=2000, now=engine.clock()))
+        await asyncio.wait_for(job.out.get(), 10)  # first chunk
+        assert await _running(8001) >= 1
+        engine.cancel(job)
+        for _ in range(50):
+            if await _running(8001) == 0:
+                break
+            await asyncio.sleep(0.1)
+    finally:
+        await engine.stop()
+        await engine.client.aclose()
     assert await _running(8001) == 0
 
 
@@ -85,6 +88,8 @@ async def test_gateway_absorbs_simulator_429s(cfg):
         responses = await asyncio.gather(
             *[client.post("/v1/chat/completions", json=body, headers=AUTH) for _ in range(6)]
         )
+        saturated_until = engine.schedulers["sim-small"].saturated_until
     finally:
         await _close(client, engine)
+    assert saturated_until > 0, "the burst never drew a 429 from sim-small"
     assert [r.status_code for r in responses] == [200] * 6
